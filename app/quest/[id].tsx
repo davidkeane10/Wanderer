@@ -20,6 +20,7 @@ import { MapPreview } from "../../src/components/MapPreview";
 import { formatScore, timeAgo } from "../../src/utils/formatters";
 import type { ActivityType, FeedItem, FeedSource } from "../../src/types/feed";
 import { getActivityInsights, type ActivityInsights } from "../../src/services/ollama";
+import { trackQuestViewed, trackQuestExternalLink } from "../../src/services/analytics";
 
 interface ActivityInfo {
   label: string;
@@ -490,6 +491,17 @@ export default function QuestDetailScreen() {
 
   useEffect(() => {
     if (!item) return;
+    trackQuestViewed({
+      questId: item.id,
+      title: item.title,
+      source: item.source,
+      activityType: item.activityType ?? "unknown",
+      hasCoords: item.locationCoords !== null,
+    });
+  }, [item?.id]);
+
+  useEffect(() => {
+    if (!item) return;
     cancelledRef.current = false;
     setInsightsLoading(true);
 
@@ -822,7 +834,10 @@ export default function QuestDetailScreen() {
           {/* View on source — prominent, always visible */}
           <TouchableOpacity
             style={[styles.sourceBtn, { borderColor: sourceColor + "44" }]}
-            onPress={() => safeOpenUrl(item!.externalUrl)}
+            onPress={() => {
+              trackQuestExternalLink({ questId: item!.id, source: item!.source });
+              safeOpenUrl(item!.externalUrl);
+            }}
           >
             <Ionicons name={sourceIcon} size={20} color={sourceColor} />
             <View style={{ flex: 1 }}>

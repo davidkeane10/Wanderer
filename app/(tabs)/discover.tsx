@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ResultsScreen } from "../../src/components/ResultsScreen";
@@ -6,6 +6,7 @@ import { SearchScreen } from "../../src/components/SearchScreen";
 import { useQuestSearch } from "../../src/hooks/useQuestSearch";
 import type { SearchInput } from "../../src/hooks/useQuestSearch";
 import { useLocation } from "../../src/context/LocationContext";
+import { trackScreen, trackSearch, trackSearchResultsReceived } from "../../src/services/analytics";
 
 export default function DiscoverTab() {
   const insets = useSafeAreaInsets();
@@ -15,9 +16,26 @@ export default function DiscoverTab() {
 
   const showResults = phase !== "idle" || results.length > 0 || error !== null;
 
+  useEffect(() => { trackScreen("Discover"); }, []);
+
+  useEffect(() => {
+    if (phase === "done" && results.length > 0) {
+      trackSearchResultsReceived({
+        category: lastInput?.category ?? "unknown",
+        resultCount: results.length,
+        hasMapPins: results.some((r) => r.locationCoords !== null),
+      });
+    }
+  }, [phase]);
+
   const handleSearch = useCallback(
     (input: SearchInput) => {
       setLastInput(input);
+      trackSearch({
+        category: input.category,
+        distanceKm: input.distanceKm,
+        descriptionLength: input.description.trim().length,
+      });
       search(input);
     },
     [search]
