@@ -1,0 +1,228 @@
+/**
+ * LeafletMap — web implementation using an iframe.
+ * Expo automatically picks this file on web, LeafletMap.native.tsx on iOS/Android.
+ */
+
+import React, { useEffect, useRef } from "react";
+import { StyleSheet, View } from "react-native";
+import type { MapMarker } from "./LeafletMap.native";
+
+interface LeafletMapProps {
+  markers: MapMarker[];
+  selectedId: string | null;
+  userLat?: number | null;
+  userLng?: number | null;
+  onMarkerTap?: (id: string) => void;
+}
+
+const MAP_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no,width=device-width"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#1e293b}
+#map{width:100%;height:100%}
+.leaflet-tile-pane{filter:brightness(0.85) saturate(0.9)}
+.pin{border-radius:50%;border:2.5px solid #fff;display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;font-weight:700;color:#fff;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,0.55);transition:transform .15s}
+.pn{background:#6366f1;width:28px;height:28px;font-size:11px}
+.ps{background:#f59e0b;width:34px;height:34px;font-size:13px}
+.pu{background:#22c55e;width:14px;height:14px;box-shadow:0 0 0 5px rgba(34,197,94,0.25)}
+#tip{position:fixed;z-index:9999;pointer-events:none;opacity:0;transition:opacity 0.18s;max-width:220px;min-width:160px;background:#1e293b;border:1px solid #334155;border-radius:14px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.6)}
+#tip.show{opacity:1}
+#tip-img{width:100%;height:110px;object-fit:cover;display:block;background:#0f172a}
+#tip-img.hidden{display:none}
+#tip-body{padding:10px 12px 12px}
+#tip-title{font-size:13px;font-weight:700;color:#f1f5f9;line-height:17px;margin-bottom:5px}
+#tip-desc{font-size:11px;color:#94a3b8;line-height:15px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="tip">
+  <img id="tip-img" src="" alt=""/>
+  <div id="tip-body">
+    <div id="tip-title"></div>
+    <div id="tip-desc"></div>
+  </div>
+</div>
+<script>
+var map=L.map('map',{zoomControl:false});
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+map.setView([20,0],2);
+var _m={},_sel=null,_um=null;
+var _tip=document.getElementById('tip');
+var _tipImg=document.getElementById('tip-img');
+var _tipTitle=document.getElementById('tip-title');
+var _tipDesc=document.getElementById('tip-desc');
+var _tipTimer=null;
+
+function _showTip(x,y,item){
+  clearTimeout(_tipTimer);
+  _tipTitle.textContent=item.title||'';
+  _tipDesc.textContent=item.description||'';
+  if(item.imageUrl){_tipImg.src=item.imageUrl;_tipImg.classList.remove('hidden');}
+  else{_tipImg.src='';_tipImg.classList.add('hidden');}
+  var tw=230,th=item.imageUrl?220:90;
+  var lx=Math.min(x+14,window.innerWidth-tw-8);
+  var ly=Math.max(y-th-14,8);
+  _tip.style.left=lx+'px';
+  _tip.style.top=ly+'px';
+  _tip.classList.add('show');
+}
+function _hideTip(delay){
+  clearTimeout(_tipTimer);
+  _tipTimer=setTimeout(function(){_tip.classList.remove('show');},delay||0);
+}
+
+function _icon(n,sel){
+  var c=sel?'pin ps':'pin pn',s=sel?34:28;
+  return L.divIcon({className:'',html:'<div class="'+c+'">'+n+'</div>',iconSize:[s,s],iconAnchor:[s/2,s/2]});
+}
+function setMarkers(list){
+  Object.values(_m).forEach(function(o){o.m.remove();});
+  _m={};_sel=null;_hideTip(0);
+  var pts=[];
+  list.forEach(function(item,i){
+    if(item.lat==null||item.lng==null)return;
+    var mk=L.marker([item.lat,item.lng],{icon:_icon(i+1,false)}).addTo(map);
+    mk.on('mouseover',function(e){_showTip(e.originalEvent.clientX,e.originalEvent.clientY,item);});
+    mk.on('mousemove',function(e){_showTip(e.originalEvent.clientX,e.originalEvent.clientY,item);});
+    mk.on('mouseout',function(){_hideTip(200);});
+    mk.on('click',function(e){
+      _showTip(e.originalEvent.clientX,e.originalEvent.clientY,item);
+      _hideTip(2200);
+      window.parent.postMessage(JSON.stringify({type:'tap',id:item.id}),'*');
+    });
+    _m[item.id]={m:mk,n:i+1,data:item};
+    pts.push([item.lat,item.lng]);
+  });
+  if(!_sel){
+    if(pts.length===1){map.setView(pts[0],13);}
+    else if(pts.length>1){try{map.fitBounds(pts,{padding:[45,45],maxZoom:12});}catch(e){map.setView(pts[0],12);}}
+  }
+}
+function selectMarker(id){
+  if(_sel&&_m[_sel]){var p=_m[_sel];p.m.setIcon(_icon(p.n,false));}
+  _hideTip(0);
+  _sel=id;
+  if(id&&_m[id]){var c=_m[id];c.m.setIcon(_icon(c.n,true));map.flyTo(c.m.getLatLng(),13,{animate:true,duration:0.5});}
+}
+function setUser(lat,lng){
+  if(_um)_um.remove();
+  _um=L.marker([lat,lng],{icon:L.divIcon({className:'',html:'<div class="pin pu"></div>',iconSize:[14,14],iconAnchor:[7,7]})}).addTo(map);
+}
+map.on('click',function(){_hideTip(0);});
+window.addEventListener('message',function(e){
+  try{
+    var msg=JSON.parse(e.data);
+    if(msg.type==='markers')setMarkers(msg.data);
+    else if(msg.type==='select')selectMarker(msg.id);
+    else if(msg.type==='user')setUser(msg.lat,msg.lng);
+  }catch(e){}
+});
+</script>
+</body>
+</html>`;
+
+export function LeafletMap({
+  markers,
+  selectedId,
+  userLat,
+  userLng,
+  onMarkerTap,
+}: LeafletMapProps) {
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const readyRef = useRef(false);
+  const pendingRef = useRef<string[]>([]);
+
+  function send(msg: object) {
+    const json = JSON.stringify(msg);
+    if (readyRef.current && iframeRef.current?.contentWindow) {
+      iframeRef.current.contentWindow.postMessage(json, "*");
+    } else {
+      pendingRef.current.push(json);
+    }
+  }
+
+  // Listen for messages from the iframe
+  useEffect(() => {
+    function handler(e: MessageEvent) {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "tap" && onMarkerTap) {
+          onMarkerTap(msg.id);
+        }
+      } catch {}
+    }
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, [onMarkerTap]);
+
+  function handleLoad() {
+    readyRef.current = true;
+    // Flush pending messages
+    for (const json of pendingRef.current) {
+      iframeRef.current?.contentWindow?.postMessage(json, "*");
+    }
+    pendingRef.current = [];
+    // Push current state
+    if (markers.length > 0) {
+      send({ type: "markers", data: markers });
+    }
+    if (userLat != null && userLng != null) {
+      send({ type: "user", lat: userLat, lng: userLng });
+    }
+    if (selectedId) {
+      send({ type: "select", id: selectedId });
+    }
+  }
+
+  useEffect(() => {
+    send({ type: "markers", data: markers });
+  }, [markers]);
+
+  useEffect(() => {
+    send({ type: "select", id: selectedId });
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (userLat != null && userLng != null) {
+      send({ type: "user", lat: userLat, lng: userLng });
+    }
+  }, [userLat, userLng]);
+
+  return (
+    <View style={styles.container}>
+      {/* @ts-ignore — iframe is valid on web via react-native-web */}
+      <iframe
+        ref={iframeRef}
+        srcDoc={MAP_HTML}
+        style={iframeStyle}
+        onLoad={handleLoad}
+        title="Quest Map"
+        sandbox="allow-scripts allow-same-origin"
+      />
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: "#1e293b",
+    overflow: "hidden",
+  },
+});
+
+const iframeStyle: React.CSSProperties = {
+  flex: 1,
+  width: "100%",
+  height: "100%",
+  border: "none",
+  backgroundColor: "#1e293b",
+  display: "block",
+};
