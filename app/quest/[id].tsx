@@ -4,12 +4,14 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  KeyboardAvoidingView,
   Linking,
   Modal,
   Platform,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
@@ -21,6 +23,7 @@ import { formatScore, timeAgo } from "../../src/utils/formatters";
 import type { ActivityType, FeedItem, FeedSource } from "../../src/types/feed";
 import { getActivityInsights, type ActivityInsights } from "../../src/services/ollama";
 import { trackQuestViewed, trackQuestExternalLink } from "../../src/services/analytics";
+import { getSpotRatingSummary, submitSpotRating, type SpotRatingSummary } from "../../src/services/spotRatings";
 
 interface ActivityInfo {
   label: string;
@@ -489,6 +492,14 @@ export default function QuestDetailScreen() {
   const [sendingToGroup, setSendingToGroup] = useState<string | null>(null);
   const [sentToGroup, setSentToGroup] = useState<string | null>(null);
 
+  // Rating
+  const [communityRating, setCommunityRating] = useState<SpotRatingSummary | null>(null);
+  const [showRateModal, setShowRateModal] = useState(false);
+  const [rateStars, setRateStars] = useState(0);
+  const [rateComment, setRateComment] = useState("");
+  const [rateSubmitting, setRateSubmitting] = useState(false);
+  const [rateDone, setRateDone] = useState(false);
+
   useEffect(() => {
     if (!item) return;
     trackQuestViewed({
@@ -498,6 +509,11 @@ export default function QuestDetailScreen() {
       activityType: item.activityType ?? "unknown",
       hasCoords: item.locationCoords !== null,
     });
+  }, [item?.id]);
+
+  useEffect(() => {
+    if (!item) return;
+    getSpotRatingSummary(item.id).then(setCommunityRating).catch(() => {});
   }, [item?.id]);
 
   useEffect(() => {
@@ -556,6 +572,28 @@ export default function QuestDetailScreen() {
       setSentToGroup(groupId);
     } finally {
       setSendingToGroup(null);
+    }
+  }
+
+  function handleOpenRateModal() {
+    setRateStars(communityRating?.userStars ?? 0);
+    setRateComment("");
+    setRateDone(false);
+    setShowRateModal(true);
+  }
+
+  async function handleSubmitRating() {
+    if (rateStars === 0 || !item) return;
+    setRateSubmitting(true);
+    try {
+      await submitSpotRating(item.id, item.title, rateStars, rateComment);
+      setRateDone(true);
+      getSpotRatingSummary(item.id).then(setCommunityRating).catch(() => {});
+      setTimeout(() => setShowRateModal(false), 1800);
+    } catch {
+      // silently fail
+    } finally {
+      setRateSubmitting(false);
     }
   }
 
@@ -635,6 +673,30 @@ export default function QuestDetailScreen() {
             </View>
           )}
 
+          {/* Community accuracy rating */}
+          {communityRating && communityRating.reviewCount > 0 && (
+            <View style={styles.communityRatingRow}>
+              <View style={styles.communityStars}>
+                {[1, 2, 3, 4, 5].map((star) => (
+                  <Ionicons
+                    key={star}
+                    name={communityRating.avgRating >= star ? "star" : communityRating.avgRating >= star - 0.5 ? "star-half" : "star-outline"}
+                    size={14}
+                    color="#f59e0b"
+                  />
+                ))}
+              </View>
+              <Text style={styles.communityRatingText}>
+                {communityRating.avgRating.toFixed(1)} · {communityRating.reviewCount} {communityRating.reviewCount === 1 ? "review" : "reviews"}
+              </Text>
+              {communityRating.userStars != null && (
+                <View style={styles.yourRatingPill}>
+                  <Text style={styles.yourRatingText}>You: {communityRating.userStars}★</Text>
+                </View>
+              )}
+            </View>
+          )}
+
           {/* Stats row */}
           <View style={styles.statsRow}>
             {item.score != null && (
@@ -698,6 +760,19 @@ export default function QuestDetailScreen() {
             <Ionicons name="chevron-forward" size={14} color="#818cf844" style={{ marginLeft: "auto" }} />
           </TouchableOpacity>
 
+          {/* Rate this Spot button */}
+          <TouchableOpacity
+            style={styles.rateBtn}
+            onPress={handleOpenRateModal}
+            activeOpacity={0.85}
+          >
+            <Ionicons name="star-half-outline" size={18} color="#f59e0b" />
+            <Text style={styles.rateBtnText}>
+              {communityRating?.userStars != null ? `Your rating: ${communityRating.userStars}★  — Update` : "Is this accurate? Rate this Spot"}
+            </Text>
+            <Ionicons name="chevron-forward" size={14} color="#f59e0b44" style={{ marginLeft: "auto" }} />
+          </TouchableOpacity>
+
           {/* Send to Group modal */}
           <Modal
             visible={showGroupModal}
@@ -754,6 +829,76 @@ export default function QuestDetailScreen() {
                 )}
               </TouchableOpacity>
             </TouchableOpacity>
+          </Modal>
+
+          {/* Rate this Spot modal */}
+          <Modal
+            visible={showRateModal}
+            transparent
+            animationType="slide"
+            onRequestClose={() => setShowRateModal(false)}
+          >
+            <KeyboardAvoidingView
+              style={styles.modalBackdrop}
+              behavior={Platform.OS === "ios" ? "padding" : undefined}
+            >
+              <TouchableOpacity
+                style={{ flex: 1 }}
+                activeOpacity={1}
+                onPress={() => setShowRateModal(false)}
+              />
+              <View style={styles.modalSheet}>
+                <View style={styles.modalHandle} />
+
+                {rateDone ? (
+                  <View style={styles.rateDoneBox}>
+                    <Ionicons name="checkmark-circle" size={48} color="#22c55e" />
+                    <Text style={styles.rateDoneTitle}>Thanks for your feedback!</Text>
+                    <Text style={styles.rateDoneSub}>Your rating helps other explorers.</Text>
+                  </View>
+                ) : (
+                  <>
+                    <Text style={styles.modalTitle}>Rate this Spot</Text>
+                    <Text style={styles.modalSubtitle}>Was this accurate? How was your visit?</Text>
+
+                    <View style={styles.starPickerRow}>
+                      {[1, 2, 3, 4, 5].map((star) => (
+                        <TouchableOpacity key={star} onPress={() => setRateStars(star)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                          <Ionicons
+                            name={rateStars >= star ? "star" : "star-outline"}
+                            size={40}
+                            color={rateStars >= star ? "#f59e0b" : "#334155"}
+                          />
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+
+                    <TextInput
+                      style={styles.rateCommentInput}
+                      placeholder="Add a comment (optional)…"
+                      placeholderTextColor="#475569"
+                      value={rateComment}
+                      onChangeText={setRateComment}
+                      multiline
+                      maxLength={300}
+                      numberOfLines={3}
+                    />
+
+                    <TouchableOpacity
+                      style={[styles.rateSubmitBtn, (rateStars === 0 || rateSubmitting) && styles.rateSubmitBtnDisabled]}
+                      onPress={handleSubmitRating}
+                      disabled={rateStars === 0 || rateSubmitting}
+                      activeOpacity={0.85}
+                    >
+                      {rateSubmitting
+                        ? <ActivityIndicator color="#fff" size="small" />
+                        : <Text style={styles.rateSubmitText}>Submit Rating</Text>
+                      }
+                    </TouchableOpacity>
+                  </>
+                )}
+              </View>
+            </KeyboardAvoidingView>
           </Modal>
 
           {/* Trail stats — distance + elevation (hikes / OSM routes) */}
@@ -1405,5 +1550,105 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#475569",
     marginTop: 2,
+  },
+
+  // ── Community rating ──
+  communityRatingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 14,
+    flexWrap: "wrap",
+  },
+  communityStars: {
+    flexDirection: "row",
+    gap: 2,
+  },
+  communityRatingText: {
+    fontSize: 13,
+    color: "#f59e0b",
+    fontWeight: "600",
+  },
+  yourRatingPill: {
+    backgroundColor: "#1c1408",
+    borderWidth: 1,
+    borderColor: "#78350f",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 20,
+  },
+  yourRatingText: {
+    fontSize: 11,
+    color: "#fbbf24",
+    fontWeight: "700",
+  },
+
+  // ── Rate button ──
+  rateBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: "#1c1408",
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: "#78350f",
+  },
+  rateBtnText: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#f59e0b",
+    flex: 1,
+  },
+
+  // ── Rate modal ──
+  starPickerRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 12,
+    paddingVertical: 20,
+  },
+  rateCommentInput: {
+    backgroundColor: "#0f172a",
+    borderRadius: 12,
+    padding: 14,
+    fontSize: 15,
+    color: "#f1f5f9",
+    borderWidth: 1,
+    borderColor: "#334155",
+    minHeight: 80,
+    textAlignVertical: "top",
+    marginBottom: 16,
+  },
+  rateSubmitBtn: {
+    backgroundColor: "#f59e0b",
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  rateSubmitBtnDisabled: {
+    backgroundColor: "#334155",
+  },
+  rateSubmitText: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#0f172a",
+  },
+  rateDoneBox: {
+    alignItems: "center",
+    gap: 12,
+    paddingVertical: 32,
+  },
+  rateDoneTitle: {
+    fontSize: 20,
+    fontWeight: "800",
+    color: "#f1f5f9",
+  },
+  rateDoneSub: {
+    fontSize: 14,
+    color: "#64748b",
   },
 });
