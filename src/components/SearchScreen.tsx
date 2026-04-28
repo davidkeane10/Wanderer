@@ -208,7 +208,10 @@ export function SearchScreen({ onSearch }: SearchScreenProps) {
             <Ionicons name="arrow-back" size={20} color="#94a3b8" />
           </TouchableOpacity>
         ) : (
-          <View style={styles.backBtnPlaceholder} />
+          <TouchableOpacity style={styles.addSpotBtn} onPress={() => router.push("/submit-spot" as any)} activeOpacity={0.8}>
+            <Ionicons name="add-circle-outline" size={15} color="#f59e0b" />
+            <Text style={styles.addSpotBtnText}>Add a spot</Text>
+          </TouchableOpacity>
         )}
         <StepDots />
         {/* AI status pill */}
@@ -713,4 +716,17 @@ const styles = StyleSheet.create({
     borderColor: "#334155",
   },
   gateCityBtnText: { fontSize: 16, fontWeight: "700", color: "#94a3b8" },
+
+  addSpotBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#1c1408",
+    borderRadius: 20,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: "#78350f",
+  },
+  addSpotBtnText: { fontSize: 12, color: "#f59e0b", fontWeight: "700" },
 });
