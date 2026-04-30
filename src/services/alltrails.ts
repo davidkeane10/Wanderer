@@ -128,7 +128,7 @@ function elementToFeedItem(el: OverpassElement): FeedItem | null {
   // Classify activity type — keep everything as "trails" unless obviously not
   let activityType: FeedItem["activityType"] = "trails";
   if (tags.tourism === "museum") activityType = "arts";
-  else if (tags.tourism === "camp_site") activityType = "backpacking";
+  else if (tags.tourism === "camp_site" || tags.amenity === "shelter" || tags.amenity === "wilderness_hut") activityType = "backpacking";
   else if (tags.natural === "cave_entrance") activityType = "urbex";
   // Note: historic ruins stay as "trails" so they appear in hiking results
 
@@ -213,6 +213,11 @@ async function runOverpassQuery(query: string): Promise<OverpassElement[]> {
   return [];
 }
 
+export interface TrailFetchOptions {
+  /** Backpacking mode: larger radius, camping/shelter nodes, longer routes. */
+  backpackingMode?: boolean;
+}
+
 /**
  * Fetch hiking trails, peaks, and viewpoints within radiusMeters of the given
  * coordinates using the OpenStreetMap Overpass API.
@@ -220,15 +225,23 @@ async function runOverpassQuery(query: string): Promise<OverpassElement[]> {
  * Single query covering nodes (peaks, viewpoints, waterfalls), named ways
  * (paths, footways), and route relations. Falls back to a mirror endpoint
  * if the primary Overpass server is busy or rate-limits the request.
+ *
+ * Pass `backpackingMode: true` when the user description mentions overnight/
+ * multi-day trips — this expands the radius, adds backcountry campsites and
+ * wilderness shelters, and returns up to 100 items instead of 60.
  */
 export async function fetchNearbyTrails(
   latitude: number,
   longitude: number,
-  radiusMeters = 50_000
+  radiusMeters = 50_000,
+  options: TrailFetchOptions = {}
 ): Promise<FeedItem[]> {
-  // Overpass times out on large bounding boxes — cap at 25 km.
-  // OSM trail data is dense; 25 km is plenty for a useful results set.
-  const clampedRadius = Math.min(radiusMeters, 25_000);
+  const { backpackingMode = false } = options;
+
+  // Backpacking searches warrant a larger area — people drive further for
+  // overnight trips. Cap regular searches at 25 km to avoid Overpass timeouts.
+  const maxRadius = backpackingMode ? 50_000 : 25_000;
+  const clampedRadius = Math.min(radiusMeters, maxRadius);
 
   // Bounding box is much faster than `around:` on Overpass — the server can use
   // its spatial index directly instead of computing per-element circle membership.
@@ -240,9 +253,18 @@ export async function fetchNearbyTrails(
   const e = (longitude + lonDelta).toFixed(6);
   const bbox = `${s},${w},${n},${e}`;
 
+  // Backpacking-specific nodes that are irrelevant for day hikes
+  const backpackingNodes = backpackingMode ? `
+  node["tourism"="camp_site"]["backcountry"="yes"]["name"](${bbox});
+  node["amenity"="shelter"]["name"](${bbox});
+  node["amenity"="wilderness_hut"]["name"](${bbox});
+  relation["route"="hiking"]["distance"](${bbox});
+` : "";
+
   // Single query — no parallel requests to avoid Overpass rate-limiting.
   // node entries always carry lat/lon; way/relation entries use `out center`
   // so Overpass computes a centroid for them.
+  const resultCap = backpackingMode ? 100 : 60;
   const query = `
 [out:json][timeout:55];
 (
@@ -264,8 +286,8 @@ export async function fetchNearbyTrails(
   relation["route"="hiking"]["name"](${bbox});
   relation["route"="foot"]["name"](${bbox});
   relation["boundary"="national_park"]["name"](${bbox});
-);
-out center tags 60;
+${backpackingNodes});
+out center tags ${resultCap};
 `.trim();
 
   const elements = await runOverpassQuery(query);
@@ -288,5 +310,15 @@ out center tags 60;
     console.log(`[AllTrails] Items after name+coord filter: ${items.length}`);
   }
 
-  return items.slice(0, 60);
+  if (backpackingMode) {
+    // Prefer longer trails and camping spots at the top of results
+    items.sort((a, b) => {
+      const aIsBackpacking = a.activityType === "backpacking" ? 1 : 0;
+      const bIsBackpacking = b.activityType === "backpacking" ? 1 : 0;
+      if (aIsBackpacking !== bIsBackpacking) return bIsBackpacking - aIsBackpacking;
+      return (b.trailDistanceKm ?? 0) - (a.trailDistanceKm ?? 0);
+    });
+  }
+
+  return items.slice(0, resultCap);
 }

@@ -20,6 +20,7 @@ export interface QueryParams {
   estimatedDurationHours: number | null;
   trailDistanceKm: number | null;
   summary: string;
+  isBackpacking?: boolean;
 }
 
 export interface EnrichedResult {

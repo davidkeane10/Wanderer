@@ -8,12 +8,42 @@ import type { FeedItem } from "../types/feed";
 
 const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
 
+const OVERPASS_FALLBACKS = [
+  OVERPASS_URL,
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+];
+
+async function runOverpassQuery(query: string, timeoutMs = 50_000): Promise<OverpassElement[]> {
+  for (const endpoint of OVERPASS_FALLBACKS) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `data=${encodeURIComponent(query)}`,
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!response.ok) continue;
+      const json: OverpassResponse = await response.json();
+      const elements = json.elements ?? [];
+      if (elements.length > 0) return elements;
+    } catch {
+      // try next endpoint
+    }
+  }
+  return [];
+}
+
 interface OverpassNode {
   type: "node";
   id: number;
   lat: number;
   lon: number;
   tags: Record<string, string>;
+  timestamp?: string; // ISO 8601 — present when query uses `out meta`
 }
 
 interface OverpassWayOrRelation {
@@ -21,6 +51,7 @@ interface OverpassWayOrRelation {
   id: number;
   center?: { lat: number; lon: number };
   tags: Record<string, string>;
+  timestamp?: string; // ISO 8601 — present when query uses `out meta`
 }
 
 type OverpassElement = OverpassNode | OverpassWayOrRelation;
@@ -29,6 +60,57 @@ interface OverpassResponse {
   elements: OverpassElement[];
 }
 
+
+/**
+ * Returns true if OSM tags indicate the structure no longer exists physically.
+ * Demolished/razed sites are excluded — there's nothing to visit.
+ */
+function isDemolished(tags: Record<string, string>): boolean {
+  return (
+    tags.demolished === "yes" ||
+    tags.razed === "yes" ||
+    tags.removed === "yes" ||
+    tags.lifecycle === "demolished" ||
+    tags["demolished:building"] != null ||
+    tags["razed:building"] != null
+  );
+}
+
+/**
+ * Returns a short human-readable note on how confident we are that the place
+ * is still abandoned, based on OSM check_date and the element's edit timestamp.
+ *
+ * check_date / survey:date — a mapper physically visited and confirmed the state.
+ * timestamp               — last time *anyone* edited the element in OSM.
+ *
+ * Returns null when there is no date signal at all.
+ */
+function getVerificationNote(tags: Record<string, string>, timestamp?: string): string | null {
+  const currentYear = new Date().getFullYear();
+
+  // Explicit field survey beats everything — a human stood there and confirmed it
+  const surveyDate = tags["check_date"] ?? tags["survey:date"] ?? tags["source:date"];
+  if (surveyDate) {
+    const year = new Date(surveyDate).getFullYear();
+    if (isNaN(year)) return null;
+    const age = currentYear - year;
+    if (age <= 1) return `Verified on-site ${year}`;
+    if (age <= 3) return `Surveyed ${year}`;
+    return `Last surveyed ${year} — verify before visiting`;
+  }
+
+  // Fall back to the OSM edit timestamp (less reliable — any edit triggers it)
+  if (timestamp) {
+    const year = new Date(timestamp).getFullYear();
+    if (isNaN(year)) return null;
+    const age = currentYear - year;
+    if (age <= 1) return `OSM updated ${year}`;
+    if (age <= 3) return `OSM data from ${year}`;
+    return `OSM data from ${year} — may have changed`;
+  }
+
+  return null;
+}
 
 /**
  * Returns true if OSM tags indicate the place is currently operational/active.
@@ -91,7 +173,7 @@ function getTypeLabel(tags: Record<string, string>): string {
   return "Urbex Site";
 }
 
-function buildDescription(tags: Record<string, string>): string {
+function buildDescription(tags: Record<string, string>, timestamp?: string): string {
   const parts: string[] = [];
 
   const typeLabel = getTypeLabel(tags);
@@ -106,6 +188,9 @@ function buildDescription(tags: Record<string, string>): string {
   }
   if (tags.website) parts.push("Has website");
 
+  const verificationNote = getVerificationNote(tags, timestamp);
+  if (verificationNote) parts.push(verificationNote);
+
   return parts.join(" · ");
 }
 
@@ -113,15 +198,14 @@ function elementToFeedItem(el: OverpassElement): FeedItem | null {
   const tags = el.tags ?? {};
   const realName = tags.name ?? tags["name:en"] ?? tags["abandoned:name"] ?? null;
 
-  // Skip unnamed items — "Ruins" / "Abandoned Site" as both title and
-  // description is useless; OSM has thousands of untagged nodes like this.
   if (!realName) return null;
+
+  // Nothing to visit if the structure has been torn down
+  if (isDemolished(tags)) return null;
 
   // Skip places that are still actively operated (e.g. university buildings
   // that happen to carry a historic=ruins or abandoned=yes tag in OSM).
   if (isCurrentlyOperational(tags)) return null;
-
-  const name = realName;
 
   let coords: { latitude: number; longitude: number } | null = null;
   if (el.type === "node") {
@@ -131,20 +215,19 @@ function elementToFeedItem(el: OverpassElement): FeedItem | null {
     if (c) coords = { latitude: c.lat, longitude: c.lon };
   }
 
-  // Skip elements with no coords
   if (!coords) return null;
 
   const osmType = el.type === "node" ? "node" : el.type === "relation" ? "relation" : "way";
 
   return {
     id: `osm_urbex_${el.id}`,
-    source: "trails", // reuse "trails" source type for OSM items
+    source: "trails",
     activityType: "urbex",
-    title: name,
-    description: buildDescription(tags),
+    title: realName,
+    description: buildDescription(tags, el.timestamp),
     imageUrl: tags.image ?? tags.wikimedia_commons ?? null,
     externalUrl: `https://www.openstreetmap.org/${osmType}/${el.id}`,
-    locationName: tags["addr:city"] ?? tags["addr:suburb"] ?? name,
+    locationName: tags["addr:city"] ?? tags["addr:suburb"] ?? realName,
     locationCoords: coords,
     score: null,
     commentCount: null,
@@ -154,59 +237,207 @@ function elementToFeedItem(el: OverpassElement): FeedItem | null {
   };
 }
 
+function elementToRailwayFeedItem(el: OverpassElement): FeedItem | null {
+  const tags = el.tags ?? {};
+  const isRailwayCorridor = tags.railway === "abandoned" || tags.railway === "disused";
+
+  let coords: { latitude: number; longitude: number } | null = null;
+  if (el.type === "node") {
+    coords = { latitude: (el as OverpassNode).lat, longitude: (el as OverpassNode).lon };
+  } else {
+    const c = (el as OverpassWayOrRelation).center;
+    if (c) coords = { latitude: c.lat, longitude: c.lon };
+  }
+  if (!coords) return null;
+
+  if (isRailwayCorridor) {
+    const name = tags.name ?? tags["name:en"] ?? tags["old_name"] ?? null;
+    if (!name) return null;
+    const label = tags.railway === "abandoned" ? "Abandoned Railway" : "Disused Railway";
+    const descParts = [label];
+    if (tags.description) descParts.push(tags.description);
+    if (tags["start_date"]) descParts.push(`Built ${tags["start_date"]}`);
+    if (tags.operator) descParts.push(`Former operator: ${tags.operator}`);
+    const verificationNote = getVerificationNote(tags, el.timestamp);
+    if (verificationNote) descParts.push(verificationNote);
+    const osmType = el.type === "relation" ? "relation" : "way";
+    return {
+      id: `osm_rail_line_${el.id}`,
+      source: "trails",
+      activityType: "urbex",
+      title: name,
+      description: descParts.join(" · "),
+      imageUrl: null,
+      externalUrl: `https://www.openstreetmap.org/${osmType}/${el.id}`,
+      locationName: name,
+      locationCoords: coords,
+      score: null,
+      commentCount: null,
+      createdAt: null,
+      sourceName: "Railroad Corridor",
+      rating: null,
+    };
+  }
+
+  // Structure found along the railway — skip demolished sites, then reuse the
+  // existing converter and stamp the Railroad Corridor source
+  if (isDemolished(tags)) return null;
+  const base = elementToFeedItem(el);
+  if (!base) return null;
+  return {
+    ...base,
+    id: `osm_rail_find_${el.id}`,
+    sourceName: "Railroad Corridor",
+    description: base.description
+      ? `${base.description} · Along old railroad`
+      : "Found along abandoned railroad corridor",
+  };
+}
+
+/**
+ * Fetch abandoned factories, industrial ruins, and derelict structures
+ * that sit within 500 m of an old railroad corridor.
+ *
+ * Strategy: two-pass Overpass query.
+ *   Pass 1 — collect every abandoned/disused railway way and relation in the
+ *             bounding box into a named set (.railways).
+ *   Pass 2 — query for abandoned structures within 500 m of that set, plus
+ *             the railway lines themselves so users can see the full corridor.
+ *
+ * This mirrors the common urbex heuristic of following old rail lines to find
+ * former factories, depots, water towers, and other industrial remnants that
+ * were built specifically to serve the railroad.
+ */
+export async function fetchAbandonedAlongRailways(
+  latitude: number,
+  longitude: number,
+  radiusMeters = 25_000
+): Promise<FeedItem[]> {
+  // Keep the bounding box reasonable — the inner `around:500` filter does the
+  // heavy lifting, so a 30 km box returns railways up to 30 km away while only
+  // surfacing structures within 500 m of their tracks.
+  const clampedRadius = Math.min(radiusMeters, 30_000);
+  const latDelta = clampedRadius / 111_111;
+  const lonDelta = clampedRadius / (111_111 * Math.cos((latitude * Math.PI) / 180));
+  const s = (latitude  - latDelta).toFixed(6);
+  const n = (latitude  + latDelta).toFixed(6);
+  const w = (longitude - lonDelta).toFixed(6);
+  const e = (longitude + lonDelta).toFixed(6);
+  const bbox = `${s},${w},${n},${e}`;
+
+  const ACTIVE = `[!"amenity"][!"shop"][!"office"][!"tourism"][!"opening_hours"][!"operator"]`;
+
+  const query = `
+[out:json][timeout:50];
+(
+  way["railway"~"^(abandoned|disused)$"](${bbox});
+  relation["railway"~"^(abandoned|disused)$"](${bbox});
+)->.railways;
+(
+  node(around.railways:500)["abandoned:building"];
+  way(around.railways:500)["abandoned:building"];
+  node(around.railways:500)["abandoned:industrial"];
+  way(around.railways:500)["abandoned:industrial"];
+  node(around.railways:500)["abandoned:amenity"];
+  way(around.railways:500)["abandoned:amenity"];
+  node(around.railways:500)["abandoned"="yes"]${ACTIVE};
+  way(around.railways:500)["abandoned"="yes"]${ACTIVE};
+  node(around.railways:500)["building:condition"="abandoned"];
+  way(around.railways:500)["building:condition"="abandoned"];
+  node(around.railways:500)["ruins"="yes"]${ACTIVE};
+  way(around.railways:500)["ruins"="yes"]${ACTIVE};
+  node(around.railways:500)["historic"="ruins"]${ACTIVE};
+  way(around.railways:500)["historic"="ruins"]${ACTIVE};
+  way.railways;
+  relation.railways;
+);
+out center tags meta 60;
+`.trim();
+
+  const elements = await runOverpassQuery(query);
+
+  if (__DEV__) {
+    console.log(`[AbandonedOSM] Railroad corridor query: ${elements.length} raw elements`);
+  }
+
+  const seen = new Set<number>();
+  const items = elements
+    .filter((el) => {
+      if (seen.has(el.id)) return false;
+      seen.add(el.id);
+      return true;
+    })
+    .map(elementToRailwayFeedItem)
+    .filter((item): item is FeedItem => item !== null);
+
+  if (__DEV__) {
+    console.log(`[AbandonedOSM] Railroad corridor: ${items.length} items after filtering`);
+  }
+
+  return items.slice(0, 60);
+}
+
 /**
  * Fetch abandoned buildings, ruins, and derelict structures within
  * radiusMeters of the given coordinates using the Overpass API.
+ *
+ * Uses a bounding-box filter (not `around:`) so Overpass can use its spatial
+ * index — typically 3-5× faster. Falls back through mirror endpoints if the
+ * primary server is busy.
  */
 export async function fetchNearbyAbandonedPlaces(
   latitude: number,
   longitude: number,
-  radiusMeters = 25000
+  radiusMeters = 25_000
 ): Promise<FeedItem[]> {
-  const r = radiusMeters;
-  const loc = `${latitude},${longitude}`;
+  const clampedRadius = Math.min(radiusMeters, 25_000);
+  const latDelta = clampedRadius / 111_111;
+  const lonDelta = clampedRadius / (111_111 * Math.cos((latitude * Math.PI) / 180));
+  const s = (latitude  - latDelta).toFixed(6);
+  const n = (latitude  + latDelta).toFixed(6);
+  const w = (longitude - lonDelta).toFixed(6);
+  const e = (longitude + lonDelta).toFixed(6);
+  const bbox = `${s},${w},${n},${e}`;
 
-  // Query covers the most common OSM tagging patterns for abandoned/urbex sites.
-  // Negative filters ([!"key"]) are applied at the API level so active operational
-  // places (university buildings, restaurants, managed tourist sites, etc.) are
-  // excluded before the response is even sent — reducing noise and payload size.
+  // Active-place exclusions applied server-side to keep the response small
   const ACTIVE_EXCLUSIONS = `[!"amenity"][!"shop"][!"office"][!"tourism"][!"opening_hours"][!"fee"][!"operator"][!"brand"]`;
+
   const query = `
-[out:json][timeout:25];
+[out:json][timeout:35];
 (
-  node["abandoned"="yes"]${ACTIVE_EXCLUSIONS}(around:${r},${loc});
-  way["abandoned"="yes"]${ACTIVE_EXCLUSIONS}(around:${r},${loc});
-  node["abandoned:building"](around:${r},${loc});
-  way["abandoned:building"](around:${r},${loc});
-  node["building:condition"="abandoned"](around:${r},${loc});
-  way["building:condition"="abandoned"](around:${r},${loc});
-  node["ruins"="yes"]${ACTIVE_EXCLUSIONS}(around:${r},${loc});
-  way["ruins"="yes"]${ACTIVE_EXCLUSIONS}(around:${r},${loc});
-  node["historic"="ruins"]${ACTIVE_EXCLUSIONS}(around:${r},${loc});
-  way["historic"="ruins"]${ACTIVE_EXCLUSIONS}(around:${r},${loc});
-  relation["historic"="ruins"]${ACTIVE_EXCLUSIONS}(around:${r},${loc});
-  way["disused:railway"](around:${r},${loc});
-  node["abandoned:railway"](around:${r},${loc});
-  way["abandoned:railway"](around:${r},${loc});
-  way["abandoned:industrial"](around:${r},${loc});
-  node["abandoned:amenity"](around:${r},${loc});
-  way["abandoned:amenity"](around:${r},${loc});
+  node["abandoned"="yes"]${ACTIVE_EXCLUSIONS}(${bbox});
+  way["abandoned"="yes"]${ACTIVE_EXCLUSIONS}(${bbox});
+  node["abandoned:building"](${bbox});
+  way["abandoned:building"](${bbox});
+  node["building:condition"="abandoned"](${bbox});
+  way["building:condition"="abandoned"](${bbox});
+  node["ruins"="yes"]${ACTIVE_EXCLUSIONS}(${bbox});
+  way["ruins"="yes"]${ACTIVE_EXCLUSIONS}(${bbox});
+  node["historic"="ruins"]${ACTIVE_EXCLUSIONS}(${bbox});
+  way["historic"="ruins"]${ACTIVE_EXCLUSIONS}(${bbox});
+  relation["historic"="ruins"]${ACTIVE_EXCLUSIONS}(${bbox});
+  way["disused:railway"](${bbox});
+  node["abandoned:railway"](${bbox});
+  way["abandoned:railway"](${bbox});
+  way["abandoned:industrial"](${bbox});
+  node["abandoned:amenity"](${bbox});
+  way["abandoned:amenity"](${bbox});
 );
-out center tags 40;
-  `.trim();
+out center tags meta 40;
+`.trim();
 
-  const response = await fetch(OVERPASS_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `data=${encodeURIComponent(query)}`,
-  });
+  const elements = await runOverpassQuery(query);
 
-  if (!response.ok) throw new Error(`Overpass error: ${response.status}`);
+  if (__DEV__) {
+    console.log(`[AbandonedOSM] Nearby abandoned places: ${elements.length} raw elements`);
+  }
 
-  const json: OverpassResponse = await response.json();
-
-  return json.elements
+  const items = elements
     .map(elementToFeedItem)
-    .filter((item): item is FeedItem => item !== null)
-    .slice(0, 40);
+    .filter((item): item is FeedItem => item !== null);
+
+  // Sort items with coordinates first so map pins appear as soon as results land
+  items.sort((a, b) => (b.locationCoords ? 1 : 0) - (a.locationCoords ? 1 : 0));
+
+  return items.slice(0, 40);
 }

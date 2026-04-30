@@ -12,7 +12,7 @@
  */
 
 import { useCallback, useState } from "react";
-import { fetchNearbyAbandonedPlaces } from "../services/abandonedOsm";
+import { fetchAbandonedAlongRailways, fetchNearbyAbandonedPlaces } from "../services/abandonedOsm";
 import { fetchYouTubeUrbexPlaces } from "../services/youtube";
 import { fetchNearbyTrails } from "../services/alltrails";
 import type { AISuggestion, CategoryKey, QueryParams } from "../services/ollama";
@@ -80,11 +80,12 @@ const SOURCE_PRIORITY: Record<CategoryKey, Record<string, number>> = {
     Wikidata:       1,
   },
   urbex: {
-    "Nat'l Register": 3,  // ArcGIS — NRHP historic sites
-    "Haunted Places":  3,  // ArcGIS — haunted locations
-    OpenStreetMap:     2,  // abandoned buildings, ruins
-    Wikidata:          2,  // ghost towns, abandoned mines
-    Wikipedia:         1,
+    "Nat'l Register":    3,  // ArcGIS — NRHP historic sites
+    "Haunted Places":    3,  // ArcGIS — haunted locations
+    "Railroad Corridor": 3,  // OSM — structures found along abandoned railways
+    OpenStreetMap:       2,  // abandoned buildings, ruins
+    Wikidata:            2,  // ghost towns, abandoned mines
+    Wikipedia:           1,
   },
   town: {
     Wikipedia: 2,
@@ -194,13 +195,34 @@ async function redditSearch(
 }
 
 /**
+ * Returns true when the user's description signals an overnight/multi-day trip.
+ */
+function isBackpackingSearch(description: string): boolean {
+  return /\b(backpack(?:ing)?|overnight|multi.?day|thru.?hike|backcountry|back.country|long.?distance|wilderness.camp|basecamp)\b/i.test(description);
+}
+
+// OSM SAC-scale labels as they appear in buildTrailDescription output
+const OSM_DIFFICULTY_MAP: Record<string, QueryParams["difficulty"]> = {
+  easy:         "easy",
+  moderate:     "moderate",
+  challenging:  "hard",
+  hard:         "hard",
+  "very hard":  "hard",
+  expert:       "hard",
+};
+
+/**
  * Score a FeedItem against the extracted query params.
  *
- * Scoring breakdown (max 10):
+ * Scoring breakdown (max ~12):
  *   - Each keyword found in title/description/locationName → +1 (up to 5)
- *   - Difficulty match (easy/moderate/hard in text)         → +2
- *   - Trail distance within ±40% of requested              → +2
- *   - Elevation preference match                            → +1
+ *   - Difficulty — OSM structured match (exact)            → +3 / mismatch → −3
+ *   - Difficulty — keyword fallback (no structured data)   → +2
+ *   - Trail distance: structured trailDistanceKm field     → +2 (±40%)
+ *   - Trail distance: text mentions as fallback            → +2 (±40%)
+ *   - Elevation preference match                           → +1
+ *   - Backpacking: long trail (≥15 km)                    → +3
+ *   - Backpacking: camping/overnight keywords              → +2
  *
  * Returns 0 if the item has zero keyword matches and keywords were specified
  * — the caller uses this to hard-drop irrelevant results.
@@ -218,25 +240,37 @@ function scoreAgainstQuery(item: FeedItem, params: QueryParams): number {
 
   let score = Math.min(5, kwHits); // up to 5 pts from keywords
 
-  // Difficulty match
+  // Difficulty match — try structured OSM data ("Difficulty: Easy" in description)
+  // before falling back to loose keyword scan
   if (params.difficulty) {
-    const diffWords: Record<string, string[]> = {
-      easy:     ["easy", "beginner", "gentle", "flat", "simple", "leisurely"],
-      moderate: ["moderate", "intermediate", "rolling", "some elevation"],
-      hard:     ["hard", "difficult", "challenging", "strenuous", "steep", "expert"],
-    };
-    if (diffWords[params.difficulty]?.some((w) => text.includes(w))) score += 2;
+    const osmMatch = text.match(/difficulty:\s*(easy|moderate|challenging|hard|very hard|expert)/);
+    const osmDifficulty = osmMatch ? OSM_DIFFICULTY_MAP[osmMatch[1]] : null;
+
+    if (osmDifficulty !== null) {
+      // Exact comparison against the structured OSM SAC-scale value
+      score += osmDifficulty === params.difficulty ? 3 : -3;
+    } else {
+      // No structured data — fall back to keyword scan
+      const diffWords: Record<string, string[]> = {
+        easy:     ["easy", "beginner", "gentle", "flat", "simple", "leisurely"],
+        moderate: ["moderate", "intermediate", "rolling", "some elevation"],
+        hard:     ["hard", "difficult", "challenging", "strenuous", "steep", "expert"],
+      };
+      if (diffWords[params.difficulty]?.some((w) => text.includes(w))) score += 2;
+    }
   }
 
-  // Trail distance match (±40% tolerance)
+  // Trail distance match — prefer structured FeedItem field, fall back to text
   if (params.trailDistanceKm) {
     const lo = params.trailDistanceKm * 0.6;
     const hi = params.trailDistanceKm * 1.4;
-    // Look for distance mentions in the text (e.g. "8km", "5 miles", "3.2 mi")
-    const kmMatches   = [...text.matchAll(/(\d+(?:\.\d+)?)\s*km/g)].map((m) => parseFloat(m[1]));
-    const mileMatches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*mi/g)].map((m) => parseFloat(m[1]) * 1.609);
-    const found = [...kmMatches, ...mileMatches];
-    if (found.some((d) => d >= lo && d <= hi)) score += 2;
+    if (item.trailDistanceKm != null) {
+      if (item.trailDistanceKm >= lo && item.trailDistanceKm <= hi) score += 2;
+    } else {
+      const kmMatches   = [...text.matchAll(/(\d+(?:\.\d+)?)\s*km/g)].map((m) => parseFloat(m[1]));
+      const mileMatches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*mi/g)].map((m) => parseFloat(m[1]) * 1.609);
+      if ([...kmMatches, ...mileMatches].some((d) => d >= lo && d <= hi)) score += 2;
+    }
   }
 
   // Elevation preference match
@@ -247,6 +281,15 @@ function scoreAgainstQuery(item: FeedItem, params: QueryParams): number {
       steep:    ["steep", "climb", "elevation gain", "strenuous", "summit"],
     };
     if (elevWords[params.elevationPreference]?.some((w) => text.includes(w))) score += 1;
+  }
+
+  // Backpacking preference: reward longer trails and camping
+  if (params.isBackpacking) {
+    const distKm = item.trailDistanceKm ?? 0;
+    if (distKm >= 15) score += 3;
+    else if (distKm >= 8) score += 1;
+
+    if (/\b(camp(?:site|ground|ing)?|overnight|backcountry|shelter|hut|permit)\b/.test(text)) score += 2;
   }
 
   return score;
@@ -387,8 +430,9 @@ async function fetchForCategory(
 
     // Launch all sources simultaneously — flush to UI as each one finishes.
     // Reddit is typically first (~1-2s), OSM/Wiki arrive later (~5-15s).
+    const backpacking = isBackpackingSearch(input.description);
     const redditPromise = redditSearch(CATEGORY_SUBREDDITS.hiking, citySubreddits, queryParams.keywords, locationKeywords, activityType);
-    const osmPromise    = coords ? fetchNearbyTrails(coords.latitude, coords.longitude, radiusMeters) : Promise.resolve([] as FeedItem[]);
+    const osmPromise    = coords ? fetchNearbyTrails(coords.latitude, coords.longitude, radiusMeters, { backpackingMode: backpacking }) : Promise.resolve([] as FeedItem[]);
     const wikiPromise   = coords ? fetchWikipediaNearby(coords.latitude, coords.longitude, radiusMeters, location.cityName, location.regionName) : Promise.resolve([] as FeedItem[]);
     // Reddit — fastest, show first
     const redditResult = await redditPromise.then(v => ({ status: "fulfilled" as const, value: v })).catch(e => ({ status: "rejected" as const, reason: e }));
@@ -421,11 +465,12 @@ async function fetchForCategory(
   } else if (category === "urbex") {
     if (__DEV__) console.log(`[SQ:${searchId}] 🔍 Urbex search — ${location.cityName ?? "unknown"} — ${distanceKm}km`);
 
-    const redditPromise  = redditSearch(CATEGORY_SUBREDDITS.urbex, citySubreddits, queryParams.keywords, locationKeywords, activityType);
-    const osmPromise     = coords ? fetchNearbyAbandonedPlaces(coords.latitude, coords.longitude, radiusMeters) : Promise.resolve([] as FeedItem[]);
+    const redditPromise   = redditSearch(CATEGORY_SUBREDDITS.urbex, citySubreddits, queryParams.keywords, locationKeywords, activityType);
+    const osmPromise      = coords ? fetchNearbyAbandonedPlaces(coords.latitude, coords.longitude, radiusMeters) : Promise.resolve([] as FeedItem[]);
+    const railwayPromise  = coords ? fetchAbandonedAlongRailways(coords.latitude, coords.longitude, radiusMeters) : Promise.resolve([] as FeedItem[]);
     const wikidataPromise = coords ? fetchWikidataAbandonedPlaces(coords.latitude, coords.longitude, distanceKm) : Promise.resolve([] as FeedItem[]);
-    const wikiPromise    = coords ? fetchWikipediaNearby(coords.latitude, coords.longitude, radiusMeters, location.cityName, location.regionName) : Promise.resolve([] as FeedItem[]);
-    const arcgisPromise  = coords ? fetchArcGISUrbexPlaces(coords.latitude, coords.longitude, radiusMeters) : Promise.resolve([] as FeedItem[]);
+    const wikiPromise     = coords ? fetchWikipediaNearby(coords.latitude, coords.longitude, radiusMeters, location.cityName, location.regionName) : Promise.resolve([] as FeedItem[]);
+    const arcgisPromise   = coords ? fetchArcGISUrbexPlaces(coords.latitude, coords.longitude, radiusMeters) : Promise.resolve([] as FeedItem[]);
 
     // Reddit first
     const redditResult = await redditPromise.then(v => ({ status: "fulfilled" as const, value: v })).catch(e => ({ status: "rejected" as const, reason: e }));
@@ -503,11 +548,20 @@ async function fetchForCategory(
       }
     }
 
-    // OSM + Wikidata + Wiki in parallel
-    const [osmAbandoned, wikidata, wiki] = await Promise.allSettled([osmPromise, wikidataPromise, wikiPromise]);
+    // Wave 2: OSM abandoned places — bbox query, resolves in ~5-10s. Flush immediately
+    // so map pins appear before the slower sources finish.
+    const osmAbandoned = await osmPromise
+      .then(v => ({ status: "fulfilled" as const, value: v }))
+      .catch(e => ({ status: "rejected" as const, reason: e }));
     addTracked("OSM Abandoned", osmAbandoned, osmAbandoned.status === "fulfilled" ? osmAbandoned.value.map(i => ({ ...i, activityType: "urbex" as ActivityType })) : []);
-    addTracked("Wikidata",      wikidata,     wikidata.status     === "fulfilled" ? wikidata.value.map(i => ({ ...i, activityType: "urbex" as ActivityType }))     : []);
-    addTracked("Wikipedia",     wiki,         wiki.status         === "fulfilled" ? wiki.value.filter(i => i.activityType === "urbex")                              : []);
+    flush();
+
+    // Wave 3: Railway corridor (two-pass query, ~20-40s) + Wikidata + Wiki in parallel.
+    // These enrich the list after OSM pins are already visible.
+    const [railway, wikidata, wiki] = await Promise.allSettled([railwayPromise, wikidataPromise, wikiPromise]);
+    addTracked("Railroad Corridor", railway,  railway.status  === "fulfilled" ? railway.value.map(i => ({ ...i, activityType: "urbex" as ActivityType }))  : []);
+    addTracked("Wikidata",          wikidata, wikidata.status === "fulfilled" ? wikidata.value.map(i => ({ ...i, activityType: "urbex" as ActivityType })) : []);
+    addTracked("Wikipedia",         wiki,     wiki.status     === "fulfilled" ? wiki.value.filter(i => i.activityType === "urbex")                         : []);
     flush();
 
     // ArcGIS + YouTube last
@@ -607,15 +661,21 @@ export function useQuestSearch() {
         const dl = input.description.toLowerCase();
         const milesMatch = dl.match(/(\d+(?:\.\d+)?)\s*mi(?:le)?s?/);
         const kmMatch    = dl.match(/(\d+(?:\.\d+)?)\s*km/);
+        const backpacking = isBackpackingSearch(input.description);
+        const baseKeywords = dl.match(/\b[a-z]{4,}\b/g)
+          ?.filter((w) => !["with","that","and","the","for","not","are","this","want","looking","something"].includes(w))
+          .slice(0, 6) ?? [];
+        const keywords = backpacking
+          ? [...new Set([...baseKeywords, "overnight", "camping", "backcountry", "multi-day"])].slice(0, 8)
+          : baseKeywords;
         return {
-          keywords: dl.match(/\b[a-z]{4,}\b/g)
-            ?.filter((w) => !["with","that","and","the","for","not","are","this","want","looking","something"].includes(w))
-            .slice(0, 6) ?? [],
+          keywords,
           elevationPreference: dl.includes("flat") ? "flat" : dl.includes("steep") ? "steep" : "any",
           difficulty: /\beasy\b/.test(dl) ? "easy" : /\bhard\b|\bdifficult\b|\bchallenging\b/.test(dl) ? "hard" : /\bmoderate\b/.test(dl) ? "moderate" : null,
           estimatedDurationHours: null,
           trailDistanceKm: milesMatch ? parseFloat(milesMatch[1]) * 1.609 : kmMatch ? parseFloat(kmMatch[1]) : null,
           summary: input.description,
+          isBackpacking: backpacking,
         };
       }
 
@@ -716,7 +776,7 @@ export function useQuestSearch() {
       // be pending for Ollama — either way we re-score without blocking display)
       const aiParams = await aiQueryPromise;
       if (aiParams.keywords.join() !== queryParams.keywords.join()) {
-        queryParams = aiParams;
+        queryParams = { ...aiParams, isBackpacking: queryParams.isBackpacking };
         const reScored = toQuestResults(rawItems, queryParams);
         currentResults = mergeInto([], reScored); // full re-score from raw
         if (__DEV__) console.log(`[SQ] AI re-score applied: summary="${aiParams.summary}"`);
