@@ -52,7 +52,11 @@ export default function AccountScreen() {
         text: "Sign out",
         style: "destructive",
         onPress: async () => {
-          await signOut();
+          try {
+            await signOut();
+          } catch {
+            // proceed regardless
+          }
           router.replace("/login" as any);
         },
       },
