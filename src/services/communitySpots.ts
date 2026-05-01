@@ -16,11 +16,16 @@ export async function submitCommunitySpot(input: CommunitySpotInput): Promise<vo
 
   let imageUrl: string | null = null;
   if (input.imageUri) {
-    const response = await fetch(input.imageUri);
-    const blob = await response.blob();
-    const storageRef = ref(storage, `community_spots/${userId}/${Date.now()}`);
-    await uploadBytes(storageRef, blob);
-    imageUrl = await getDownloadURL(storageRef);
+    try {
+      const response = await fetch(input.imageUri);
+      const blob = await response.blob();
+      const storageRef = ref(storage, `community_spots/${userId}/${Date.now()}`);
+      await uploadBytes(storageRef, blob);
+      imageUrl = await getDownloadURL(storageRef);
+    } catch (storageErr) {
+      // Storage rules may not be configured — save the spot without the image
+      if (__DEV__) console.warn("[CommunitySpots] Image upload failed, saving without image:", storageErr);
+    }
   }
 
   await addDoc(collection(db, "community_spots"), {

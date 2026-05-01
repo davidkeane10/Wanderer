@@ -5,6 +5,7 @@ import { useFocusEffect, useRouter } from "expo-router";
 import React, { useCallback, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -31,7 +32,6 @@ export default function SubmitSpotScreen() {
   const [imageUri, setImageUri] = useState<string | null>(null);
 
   const [submitting, setSubmitting] = useState(false);
-  const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Pick up coords placed in the singleton when returning from the map screen
@@ -73,6 +73,7 @@ export default function SubmitSpotScreen() {
     if (!canSubmit) return;
     setSubmitting(true);
     setError(null);
+    let saved = false;
     try {
       await submitCommunitySpot({
         name,
@@ -82,31 +83,16 @@ export default function SubmitSpotScreen() {
         description,
         imageUri,
       });
-      setDone(true);
-    } catch {
+      saved = true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      if (__DEV__) console.warn("[SubmitSpot] Firebase error:", msg);
+      Alert.alert("Submission failed", `Could not save your spot: ${msg}`);
       setError("Something went wrong — please try again.");
     } finally {
       setSubmitting(false);
     }
-  }
-
-  if (done) {
-    return (
-      <View style={[styles.container, { paddingTop: insets.top }]}>
-        <View style={styles.doneContainer}>
-          <View style={styles.doneIconWrap}>
-            <Ionicons name="checkmark-circle" size={72} color="#22c55e" />
-          </View>
-          <Text style={styles.doneTitle}>Spot submitted!</Text>
-          <Text style={styles.doneSub}>
-            Thanks for contributing. We'll review it and add it to the app soon.
-          </Text>
-          <TouchableOpacity style={styles.doneBtn} onPress={() => router.back()}>
-            <Text style={styles.doneBtnText}>Back to search</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
+    if (saved) router.replace("/" as any);
   }
 
   return (
@@ -537,25 +523,6 @@ const styles = StyleSheet.create({
   },
   submitBtnDisabled: { backgroundColor: "#334155", opacity: 0.6 },
   submitBtnText: { fontSize: 17, fontWeight: "800", color: "#0f172a" },
-
-  doneContainer: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    padding: 36,
-    gap: 16,
-  },
-  doneIconWrap: { marginBottom: 8 },
-  doneTitle: { fontSize: 28, fontWeight: "900", color: "#f1f5f9", textAlign: "center" },
-  doneSub: { fontSize: 15, color: "#64748b", textAlign: "center", lineHeight: 23 },
-  doneBtn: {
-    backgroundColor: "#22c55e",
-    borderRadius: 14,
-    paddingHorizontal: 28,
-    paddingVertical: 14,
-    marginTop: 8,
-  },
-  doneBtnText: { fontSize: 15, fontWeight: "700", color: "#fff" },
 
   // ── Category picker ──
   categoryGrid: {

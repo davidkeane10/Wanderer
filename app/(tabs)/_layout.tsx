@@ -46,14 +46,15 @@ export default function TabsLayout() {
       />
       <Tabs.Screen name="vote" options={{ href: null }} />
       <Tabs.Screen name="tiktok" options={{ href: null }} />
-
       <Tabs.Screen name="friends" options={{ href: null }} />
+      <Tabs.Screen name="settings" options={{ href: null }} />
+
       <Tabs.Screen
-        name="settings"
+        name="account"
         options={{
-          title: "Settings",
+          title: "Account",
           tabBarIcon: ({ color, size }) => (
-            <Ionicons name="settings-outline" size={size} color={color} />
+            <Ionicons name="person-circle-outline" size={size} color={color} />
           ),
         }}
       />

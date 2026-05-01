@@ -73,7 +73,9 @@ const TOURISM_LABELS: Record<string, string> = {
 function buildTrailDescription(tags: Record<string, string>): string {
   const parts: string[] = [];
 
-  if (tags.natural && PLACE_TYPE_LABELS[tags.natural]) {
+  if (tags.waterway === "waterfall") {
+    parts.push("Waterfall");
+  } else if (tags.natural && PLACE_TYPE_LABELS[tags.natural]) {
     parts.push(PLACE_TYPE_LABELS[tags.natural]);
   } else if (tags.historic && HISTORIC_LABELS[tags.historic]) {
     parts.push(HISTORIC_LABELS[tags.historic]);
@@ -270,7 +272,10 @@ export async function fetchNearbyTrails(
 (
   node["natural"="peak"]["name"](${bbox});
   node["natural"="viewpoint"]["name"](${bbox});
+  node["tourism"="viewpoint"]["name"](${bbox});
   node["natural"="waterfall"]["name"](${bbox});
+  node["waterway"="waterfall"]["name"](${bbox});
+  way["waterway"="waterfall"]["name"](${bbox});
   node["natural"="beach"]["name"](${bbox});
   node["natural"="cave_entrance"]["name"](${bbox});
   node["natural"="hot_spring"]["name"](${bbox});
