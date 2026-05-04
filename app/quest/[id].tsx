@@ -550,9 +550,11 @@ export default function QuestDetailScreen() {
   if (!item) {
     return (
       <View style={[styles.container, { paddingTop: insets.top }]}>
-        <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
-          <Ionicons name="arrow-back" size={24} color="#f1f5f9" />
-        </TouchableOpacity>
+        <View style={styles.navBar}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
+            <Ionicons name="arrow-back" size={22} color="#f1f5f9" />
+          </TouchableOpacity>
+        </View>
         <View style={styles.errorCenter}>
           <Text style={styles.errorText}>Quest not found.</Text>
         </View>
@@ -619,10 +621,12 @@ export default function QuestDetailScreen() {
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      {/* Back Button */}
-      <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
-        <Ionicons name="arrow-back" size={24} color="#f1f5f9" />
-      </TouchableOpacity>
+      {/* Nav bar — sits above ScrollView so it never overlaps content */}
+      <View style={styles.navBar}>
+        <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
+          <Ionicons name="arrow-back" size={22} color="#f1f5f9" />
+        </TouchableOpacity>
+      </View>
 
       <ScrollView contentContainerStyle={{ paddingBottom: insets.bottom + 32 }}>
         {/* Hero Image */}
@@ -1029,14 +1033,19 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#0f172a",
   },
+  navBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
   backBtn: {
-    position: "absolute",
-    top: 48,
-    left: 16,
-    zIndex: 10,
-    backgroundColor: "#0f172acc",
-    borderRadius: 20,
-    padding: 8,
+    width: 38,
+    height: 38,
+    borderRadius: 12,
+    backgroundColor: "#1e293b",
+    alignItems: "center",
+    justifyContent: "center",
   },
   heroImage: {
     width: "100%",

@@ -1,14 +1,17 @@
 import { Stack, useRouter, useSegments } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import React, { useEffect } from "react";
-import { ActivityIndicator, View } from "react-native";
+import { ActivityIndicator, StyleSheet, View } from "react-native";
 import { AuthProvider, useAuth } from "../src/context/AuthContext";
 import { GroupsProvider } from "../src/context/GroupsContext";
 import { LocationProvider } from "../src/context/LocationContext";
 import { SettingsProvider } from "../src/context/SettingsContext";
 
-// Redirects unauthenticated users to /login and authenticated users away from it.
-// Must be a child of AuthProvider so it can read auth state.
+/**
+ * Handles auth-based routing.
+ * The Stack always renders so the navigator exists when router.replace fires.
+ * A non-interactive overlay covers the screen during the brief auth check.
+ */
 function AuthGate({ children }: { children: React.ReactNode }) {
   const { currentUser, isLoading } = useAuth();
   const segments = useSegments();
@@ -24,16 +27,27 @@ function AuthGate({ children }: { children: React.ReactNode }) {
     }
   }, [currentUser, isLoading, segments]);
 
-  if (isLoading) {
-    return (
-      <View style={{ flex: 1, backgroundColor: "#0f172a", alignItems: "center", justifyContent: "center" }}>
-        <ActivityIndicator color="#6366f1" size="large" />
-      </View>
-    );
-  }
-
-  return <>{children}</>;
+  return (
+    <View style={styles.fill}>
+      {children}
+      {isLoading && (
+        <View style={styles.loadingOverlay}>
+          <ActivityIndicator color="#6366f1" size="large" />
+        </View>
+      )}
+    </View>
+  );
 }
+
+const styles = StyleSheet.create({
+  fill: { flex: 1 },
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "#0f172a",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+});
 
 export default function RootLayout() {
   return (

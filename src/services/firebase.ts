@@ -1,14 +1,21 @@
 /**
- * Firebase — app init, auth, and Firestore exports.
+ * Firebase — app init, auth, Firestore, and Storage exports.
  *
- * Uses Anonymous Auth so users never have to sign up.
- * Auth state is persisted via AsyncStorage on native, browser localStorage on web.
+ * Auth persistence:
+ *   - Native (iOS/Android via Expo/Metro): initializeAuth with AsyncStorage so
+ *     the session survives app restarts. Metro resolves firebase/auth to the
+ *     react-native build which exports getReactNativePersistence.
+ *   - Web: getAuth falls back to browserLocalStorage automatically.
  */
 
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getApps, initializeApp } from "firebase/app";
-import { getAuth } from "firebase/auth";
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — getReactNativePersistence is present in the Metro/RN build of firebase/auth
+import { getReactNativePersistence, initializeAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
+import { Platform } from "react-native";
 
 const firebaseConfig = {
   apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
@@ -22,10 +29,16 @@ const firebaseConfig = {
 
 export const app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
 
-// getAuth handles persistence automatically:
-//   - Web/PWA  → browser localStorage
-//   - Native   → falls back gracefully (PWA is the primary target)
+// On native, explicitly use AsyncStorage so the session persists across restarts.
+// On web, initializeAuth defaults to localStorage — same result, no extra config.
 function buildAuth() {
+  if (Platform.OS !== "web") {
+    return initializeAuth(app, {
+      persistence: getReactNativePersistence(AsyncStorage),
+    });
+  }
+  // Web: import getAuth lazily to avoid bundling the RN persistence module
+  const { getAuth } = require("firebase/auth");
   return getAuth(app);
 }
 

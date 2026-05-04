@@ -38,6 +38,7 @@ import type {
   Vote,
   VoteOption,
 } from "../types/social";
+import { sendVoteStartedNotifications } from "../services/notifications";
 import { useAuth } from "./AuthContext";
 
 // ─── Context shape ────────────────────────────────────────────────────────────
@@ -265,6 +266,21 @@ export function GroupsProvider({ children }: { children: React.ReactNode }) {
       await updateDoc(doc(db, "groups", groupId), {
         votes: [vote, ...group.votes],
       });
+
+      // Notify all other group members that a vote has started (non-fatal)
+      const otherIds = group.memberIds.filter((id) => id !== currentUser.uid);
+      if (otherIds.length > 0) {
+        Promise.all(otherIds.map((uid) => getDoc(doc(db, "users", uid))))
+          .then((snaps) => {
+            const tokens = snaps
+              .filter((s) => s.exists())
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              .map((s) => (s.data() as any).pushToken as string | undefined)
+              .filter((t): t is string => Boolean(t));
+            return sendVoteStartedNotifications(tokens, group.emoji, group.name, vote.question);
+          })
+          .catch(() => {});
+      }
 
       return vote;
     },

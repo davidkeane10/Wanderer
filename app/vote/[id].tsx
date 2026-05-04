@@ -12,38 +12,41 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useGroups } from "../../src/context/GroupsContext";
-import type { Vote, VoteOption } from "../../src/types/social";
+import type { Group, Vote, VoteOption } from "../../src/types/social";
 
-// ─── Borda count helpers ──────────────────────────────────────────────────────
+// ─── Scoring ──────────────────────────────────────────────────────────────────
+// Each person's #1 spot earns (n-1) points, #2 earns (n-2), … last earns 0.
+// Spot with most total points wins — this rewards being consistently ranked high
+// by everyone, not just being one person's favourite.
 
-function computeBorda(vote: Vote): Map<string, number> {
+function computeScores(vote: Vote): Map<string, number> {
   const n = vote.options.length;
   const scores = new Map<string, number>(vote.options.map((o) => [o.id, 0]));
   for (const r of vote.responses) {
-    const rankings: string[] = r.rankings ?? [];
-    rankings.forEach((id, idx) => {
+    (r.rankings ?? []).forEach((id, idx) => {
       if (scores.has(id)) scores.set(id, scores.get(id)! + (n - 1 - idx));
     });
   }
   return scores;
 }
 
-// ─── Draggable ranking list ───────────────────────────────────────────────────
+// ─── Draggable list ───────────────────────────────────────────────────────────
 
-const ITEM_H = 68;
+const ITEM_H = 72;
 const ITEM_GAP = 10;
 const STRIDE = ITEM_H + ITEM_GAP;
-const RANK_COLORS = ["#f59e0b", "#94a3b8", "#a16207"];
 
-function DraggableRankingList({
+function DraggableList({
   options,
   order,
+  disabled,
   onChange,
   onDragStart,
   onDragEnd,
 }: {
   options: VoteOption[];
   order: string[];
+  disabled?: boolean;
   onChange: (newOrder: string[]) => void;
   onDragStart?: () => void;
   onDragEnd?: () => void;
@@ -59,7 +62,6 @@ function DraggableRankingList({
   const activeIdxRef = useRef(-1);
   const dragStartY = useRef(0);
 
-  // Sync when external order changes (e.g. after submit)
   useEffect(() => {
     if (!activeIdRef.current) {
       orderRef.current = order;
@@ -68,14 +70,13 @@ function DraggableRankingList({
     }
   }, [order.join(",")]);
 
-  // Create one PanResponder per item, memoised for the lifetime of the component
   const panResponders = useRef(
     new Map(
       options.map((o) => {
         const id = o.id;
         const pr = PanResponder.create({
-          onStartShouldSetPanResponder: () => true,
-          onMoveShouldSetPanResponder: () => true,
+          onStartShouldSetPanResponder: () => !disabled,
+          onMoveShouldSetPanResponder: () => !disabled,
           onPanResponderGrant: () => {
             const idx = orderRef.current.indexOf(id);
             activeIdRef.current = id;
@@ -91,7 +92,6 @@ function DraggableRankingList({
               Math.min(dragStartY.current + gs.dy, (options.length - 1) * STRIDE)
             );
             itemY.get(id)!.setValue(newY);
-
             const newIdx = Math.round(newY / STRIDE);
             if (newIdx !== activeIdxRef.current) {
               const newOrder = [...orderRef.current];
@@ -99,8 +99,6 @@ function DraggableRankingList({
               newOrder.splice(newIdx, 0, id);
               orderRef.current = newOrder;
               activeIdxRef.current = newIdx;
-
-              // Slide other items into their new slots
               newOrder.forEach((oid, oidx) => {
                 if (oid !== id) {
                   Animated.spring(itemY.get(oid)!, {
@@ -138,7 +136,8 @@ function DraggableRankingList({
       {options.map((option) => {
         const rank = displayOrder.indexOf(option.id);
         const isActive = activeId === option.id;
-        const rc = RANK_COLORS[rank] ?? "#475569";
+        const isTop = rank === 0;
+        const isBottom = rank === options.length - 1;
 
         return (
           <Animated.View
@@ -146,6 +145,7 @@ function DraggableRankingList({
             style={[
               styles.rankItem,
               isActive && styles.rankItemActive,
+              isTop && !isActive && styles.rankItemTop,
               {
                 position: "absolute",
                 top: itemY.get(option.id),
@@ -157,19 +157,30 @@ function DraggableRankingList({
             ]}
             {...panResponders.get(option.id)!.panHandlers}
           >
-            <View style={[styles.rankBadge, { backgroundColor: rc + "22", borderColor: rc + "66" }]}>
-              <Text style={[styles.rankBadgeText, { color: rc }]}>{rank + 1}</Text>
+            {/* Rank number */}
+            <View style={[styles.rankBadge, isTop && styles.rankBadgeTop, isBottom && styles.rankBadgeBottom]}>
+              <Text style={[styles.rankNum, isTop && styles.rankNumTop]}>{rank + 1}</Text>
             </View>
-            <Text style={styles.rankOptionEmoji}>{option.emoji}</Text>
+
+            {/* Emoji + info */}
+            <Text style={styles.itemEmoji}>{option.emoji}</Text>
             <View style={{ flex: 1 }}>
-              <Text style={styles.rankOptionLabel} numberOfLines={2}>{option.label}</Text>
-              {option.meta ? <Text style={styles.rankOptionMeta}>{option.meta}</Text> : null}
+              <Text style={styles.itemLabel} numberOfLines={1}>{option.label}</Text>
+              {(option.meta ?? option.feedItem?.sourceName) ? (
+                <Text style={styles.itemMeta} numberOfLines={1}>
+                  {option.meta ?? option.feedItem?.sourceName}
+                </Text>
+              ) : null}
             </View>
-            <View style={styles.dragHandle}>
-              <View style={styles.dhLine} />
-              <View style={styles.dhLine} />
-              <View style={styles.dhLine} />
-            </View>
+
+            {/* Drag handle */}
+            {!disabled && (
+              <View style={styles.dragHandle}>
+                <View style={styles.dhLine} />
+                <View style={styles.dhLine} />
+                <View style={styles.dhLine} />
+              </View>
+            )}
           </Animated.View>
         );
       })}
@@ -177,140 +188,111 @@ function DraggableRankingList({
   );
 }
 
-// ─── Borda results ────────────────────────────────────────────────────────────
+// ─── Result rows (closed vote) ────────────────────────────────────────────────
 
 const MEDALS = ["🥇", "🥈", "🥉"];
 
-function BordaResultRow({
+function ResultRow({
   option,
   rank,
   score,
-  pct,
+  maxScore,
   isWinner,
   firstChoices,
 }: {
   option: VoteOption;
   rank: number;
   score: number;
-  pct: number;
+  maxScore: number;
   isWinner: boolean;
   firstChoices: number;
 }) {
-  const barAnim = useRef(new Animated.Value(0)).current;
+  const bar = useRef(new Animated.Value(0)).current;
   useEffect(() => {
-    Animated.timing(barAnim, { toValue: pct, duration: 700, useNativeDriver: false }).start();
-  }, [pct]);
-
-  const barColor = isWinner ? "#f59e0b" : "#6366f1";
+    Animated.timing(bar, {
+      toValue: maxScore > 0 ? (score / maxScore) * 100 : 0,
+      duration: 700,
+      useNativeDriver: false,
+    }).start();
+  }, [score, maxScore]);
 
   return (
-    <View style={[styles.bordaRow, isWinner && styles.bordaRowWinner]}>
-      <Text style={styles.bordaMedal}>{MEDALS[rank] ?? `#${rank + 1}`}</Text>
-      <Text style={styles.bordaEmoji}>{option.emoji}</Text>
+    <View style={[styles.resultRow, isWinner && styles.resultRowWinner]}>
+      <Text style={styles.resultMedal}>{MEDALS[rank] ?? `#${rank + 1}`}</Text>
+      <Text style={styles.resultEmoji}>{option.emoji}</Text>
       <View style={{ flex: 1, gap: 4 }}>
-        <Text style={styles.bordaLabel} numberOfLines={1}>{option.label}</Text>
-        <Text style={styles.bordaMeta}>
-          {score} pts{firstChoices > 0 ? ` · ${firstChoices} first choice${firstChoices !== 1 ? "s" : ""}` : ""}
-        </Text>
-        <View style={styles.bordaBarBg}>
+        <Text style={styles.resultLabel} numberOfLines={1}>{option.label}</Text>
+        <View style={styles.resultBarBg}>
           <Animated.View
             style={[
-              styles.bordaBar,
+              styles.resultBar,
               {
-                backgroundColor: barColor,
-                width: barAnim.interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] }),
+                backgroundColor: isWinner ? "#f59e0b" : "#6366f1",
+                width: bar.interpolate({ inputRange: [0, 100], outputRange: ["0%", "100%"] }),
               },
             ]}
           />
         </View>
+        <Text style={styles.resultMeta}>
+          {score} {score === 1 ? "point" : "points"}
+          {firstChoices > 0 ? ` · #1 for ${firstChoices} ${firstChoices === 1 ? "person" : "people"}` : ""}
+        </Text>
       </View>
       {isWinner && <Ionicons name="trophy" size={18} color="#f59e0b" />}
     </View>
   );
 }
 
-function BordaResults({ vote }: { vote: Vote }) {
-  const scores = computeBorda(vote);
-  const maxScore = Math.max(...Array.from(scores.values()), 1);
-  const sorted = [...vote.options].sort(
-    (a, b) => (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0)
-  );
-
-  return (
-    <View style={{ gap: 8 }}>
-      {sorted.map((option, rank) => {
-        const score = scores.get(option.id) ?? 0;
-        const firstChoices = vote.responses.filter((r) => r.rankings?.[0] === option.id).length;
-        return (
-          <BordaResultRow
-            key={option.id}
-            option={option}
-            rank={rank}
-            score={score}
-            pct={(score / maxScore) * 100}
-            isWinner={option.id === vote.winnerId}
-            firstChoices={firstChoices}
-          />
-        );
-      })}
-    </View>
-  );
-}
-
 // ─── Main screen ──────────────────────────────────────────────────────────────
 
-export default function VoteDetailScreen() {
+export default function VoteScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { groups, you, castVote, resolveVote } = useGroups();
 
   let vote: Vote | null = null;
-  let groupId = "";
-  let groupName = "";
-  let groupEmoji = "";
+  let group: Group | null = null;
   for (const g of groups) {
     const found = g.votes.find((v) => v.id === id);
-    if (found) { vote = found; groupId = g.id; groupName = g.name; groupEmoji = g.emoji; break; }
+    if (found) { vote = found; group = g; break; }
   }
 
   const isClosed = !vote ? false : vote.status === "closed" || Date.now() >= vote.deadline;
   const myResponse = vote?.responses.find((r) => r.memberId === you?.id);
-  const myRankings: string[] | null = myResponse?.rankings ?? null;
+  const myRankings = myResponse?.rankings ?? null;
 
   const [rankOrder, setRankOrder] = useState<string[]>(
     myRankings ?? vote?.options.map((o) => o.id) ?? []
   );
-  const [isEditing, setIsEditing] = useState(!myRankings);
+  const [isEditing, setIsEditing] = useState(!myRankings && !isClosed);
   const [isDragging, setIsDragging] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  // Auto-resolve when the vote closes and a winner hasn't been set yet
   const resolveAttempted = useRef(false);
   useEffect(() => {
     if (isClosed && vote && !vote.winnerId && !resolveAttempted.current && vote.responses.length > 0) {
       resolveAttempted.current = true;
-      resolveVote(groupId, vote.id);
+      resolveVote(group!.id, vote.id);
     }
   }, [isClosed, vote?.id]);
 
-  // Keep rankOrder in sync when Firestore pushes an updated response
   useEffect(() => {
     if (myRankings && !isEditing) setRankOrder(myRankings);
   }, [myRankings?.join(",")]);
 
   const handleSubmit = async () => {
-    if (!vote || submitting) return;
+    if (!vote || !group || submitting) return;
     setSubmitting(true);
     try {
-      await castVote(groupId, vote.id, rankOrder);
+      await castVote(group.id, vote.id, rankOrder);
       setIsEditing(false);
     } finally {
       setSubmitting(false);
     }
   };
 
-  if (!vote) {
+  if (!vote || !group) {
     return (
       <View style={[styles.container, { paddingTop: insets.top }]}>
         <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
@@ -330,18 +312,25 @@ export default function VoteDetailScreen() {
     ? `${hoursLeft}h ${minutesLeft}m left`
     : `${minutesLeft}m left`;
 
+  // ── Results data ─────────────────────────────────────────────────────────────
+  const scores = computeScores(vote);
+  const maxScore = Math.max(...Array.from(scores.values()), 1);
+  const sortedOptions = [...vote.options].sort(
+    (a, b) => (scores.get(b.id) ?? 0) - (scores.get(a.id) ?? 0)
+  );
   const winner = vote.winnerId ? vote.options.find((o) => o.id === vote.winnerId) : null;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      {/* Header */}
+
+      {/* ── Header ─────────────────────────────────────────────────────── */}
       <View style={styles.header}>
         <TouchableOpacity onPress={() => router.back()} style={styles.backBtn}>
           <Ionicons name="arrow-back" size={22} color="#f1f5f9" />
         </TouchableOpacity>
         <View style={styles.groupTag}>
-          <Text style={styles.groupEmoji}>{groupEmoji}</Text>
-          <Text style={styles.groupName}>{groupName}</Text>
+          <Text style={styles.groupEmoji}>{group.emoji}</Text>
+          <Text style={styles.groupName} numberOfLines={1}>{group.name}</Text>
         </View>
         <View style={[styles.timeChip, isClosed && styles.timeChipClosed]}>
           <Ionicons
@@ -353,87 +342,118 @@ export default function VoteDetailScreen() {
         </View>
       </View>
 
-      <ScrollView
-        contentContainerStyle={{ paddingBottom: insets.bottom + 40 }}
-        showsVerticalScrollIndicator={false}
-        scrollEnabled={!isDragging}
-      >
-        {/* Question */}
-        <View style={styles.questionSection}>
-          <Text style={styles.question}>{vote.question}</Text>
-          <Text style={styles.voteCount}>
-            {vote.responses.length} {vote.responses.length === 1 ? "person" : "people"} ranked
-            {!isClosed ? ` · ${vote.options.length} spots to order` : ""}
+      {/* ── CLOSED: winner + results ────────────────────────────────────── */}
+      {isClosed && (
+        <ScrollView
+          contentContainerStyle={[styles.resultsScroll, { paddingBottom: insets.bottom + 32 }]}
+          showsVerticalScrollIndicator={false}
+        >
+          {/* Winner banner */}
+          {winner && (
+            <View style={styles.winnerBanner}>
+              <Text style={styles.winnerEmoji}>{winner.emoji}</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.winnerLabel}>Group pick</Text>
+                <Text style={styles.winnerName}>{winner.label}</Text>
+              </View>
+              <Ionicons name="trophy" size={24} color="#f59e0b" />
+            </View>
+          )}
+
+          {/* Results */}
+          <Text style={styles.sectionLabel}>
+            Final Rankings · {vote.responses.length} {vote.responses.length === 1 ? "person" : "people"} voted
           </Text>
-        </View>
+          <Text style={styles.scoringNote}>
+            Each person's ranking gives points — #1 earns the most, last earns none. Highest total points wins.
+          </Text>
 
-        {/* Winner banner */}
-        {isClosed && winner && (
-          <View style={styles.winnerBanner}>
-            <Text style={styles.winnerEmoji}>{winner.emoji}</Text>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.winnerLabel}>Winner by Borda count</Text>
-              <Text style={styles.winnerName}>{winner.label}</Text>
+          {vote.responses.length === 0 ? (
+            <Text style={styles.emptyText}>No one voted before it closed.</Text>
+          ) : (
+            <View style={{ gap: 8 }}>
+              {sortedOptions.map((option, rank) => (
+                <ResultRow
+                  key={option.id}
+                  option={option}
+                  rank={rank}
+                  score={scores.get(option.id) ?? 0}
+                  maxScore={maxScore}
+                  isWinner={option.id === vote.winnerId}
+                  firstChoices={vote.responses.filter((r) => r.rankings?.[0] === option.id).length}
+                />
+              ))}
             </View>
-            <Ionicons name="trophy" size={22} color="#f59e0b" />
-          </View>
-        )}
+          )}
+        </ScrollView>
+      )}
 
-        {/* Ranking UI — only when vote is open */}
-        {!isClosed && (
-          <View style={styles.votingSection}>
-            <View style={styles.votingHeader}>
-              <Text style={styles.votingSectionTitle}>
-                {isEditing ? "Drag to rank your preferences" : "Your ranking"}
-              </Text>
-              {!isEditing && myRankings && (
-                <TouchableOpacity onPress={() => { setIsEditing(true); setRankOrder(myRankings); }}>
-                  <Text style={styles.editLink}>Edit</Text>
-                </TouchableOpacity>
-              )}
-            </View>
-            <Text style={styles.votingHint}>
-              {isEditing
-                ? "1 = top choice · drag the handle to reorder"
-                : "Submitted ✓ — tap Edit to change"}
+      {/* ── OPEN: drag-to-rank ──────────────────────────────────────────── */}
+      {!isClosed && (
+        <>
+          {/* Status row */}
+          <View style={styles.statusRow}>
+            <Text style={styles.statusText}>
+              {vote.responses.length} of {group.members.length}{" "}
+              {group.members.length === 1 ? "person" : "people"} voted
+              {isEditing ? " · drag to rank" : " · submitted ✓"}
             </Text>
+            {!isEditing && myRankings && (
+              <TouchableOpacity onPress={() => { setIsEditing(true); setRankOrder(myRankings); }}>
+                <Text style={styles.editLink}>Edit</Text>
+              </TouchableOpacity>
+            )}
+          </View>
 
-            <DraggableRankingList
+          {/* Drag list */}
+          <ScrollView
+            style={{ flex: 1 }}
+            contentContainerStyle={styles.listScroll}
+            scrollEnabled={!isDragging}
+            showsVerticalScrollIndicator={false}
+          >
+            {/* TOP label */}
+            <View style={styles.edgeLabel}>
+              <View style={styles.edgeLine} />
+              <Text style={styles.edgeLabelText}>TOP PICK  ↑</Text>
+              <View style={styles.edgeLine} />
+            </View>
+
+            <DraggableList
               options={vote.options}
               order={rankOrder}
+              disabled={!isEditing}
               onChange={setRankOrder}
               onDragStart={() => setIsDragging(true)}
               onDragEnd={() => setIsDragging(false)}
             />
 
-            {isEditing && (
+            {/* BOTTOM label */}
+            <View style={[styles.edgeLabel, { marginTop: 16 }]}>
+              <View style={styles.edgeLine} />
+              <Text style={styles.edgeLabelText}>↓  LAST PICK</Text>
+              <View style={styles.edgeLine} />
+            </View>
+          </ScrollView>
+
+          {/* Submit — pinned at bottom */}
+          {isEditing && (
+            <View style={[styles.submitRow, { paddingBottom: insets.bottom + 12 }]}>
               <TouchableOpacity
-                style={[styles.submitBtn, submitting && styles.submitBtnDisabled]}
+                style={[styles.submitBtn, submitting && styles.submitBtnLoading]}
                 onPress={handleSubmit}
                 disabled={submitting}
                 activeOpacity={0.85}
               >
                 <Ionicons name="checkmark-circle" size={18} color="#fff" />
                 <Text style={styles.submitBtnText}>
-                  {myRankings ? "Update ranking" : "Submit ranking"}
+                  {submitting ? "Submitting…" : myRankings ? "Update ranking" : "Submit ranking"}
                 </Text>
               </TouchableOpacity>
-            )}
-          </View>
-        )}
-
-        {/* Results */}
-        <View style={styles.resultsSection}>
-          <Text style={styles.resultsSectionTitle}>
-            {isClosed ? "Final Results" : "Current Standings"}
-          </Text>
-          {vote.responses.length === 0 ? (
-            <Text style={styles.noVotesText}>No rankings submitted yet</Text>
-          ) : (
-            <BordaResults vote={vote} />
+            </View>
           )}
-        </View>
-      </ScrollView>
+        </>
+      )}
     </View>
   );
 }
@@ -445,6 +465,7 @@ const styles = StyleSheet.create({
   backBtn: { padding: 4 },
   notFound: { textAlign: "center", color: "#64748b", marginTop: 40 },
 
+  // Header
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -456,7 +477,7 @@ const styles = StyleSheet.create({
   },
   groupTag: { flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
   groupEmoji: { fontSize: 18 },
-  groupName: { fontSize: 14, fontWeight: "600", color: "#94a3b8" },
+  groupName: { fontSize: 15, fontWeight: "700", color: "#f1f5f9" },
   timeChip: {
     flexDirection: "row",
     alignItems: "center",
@@ -470,34 +491,41 @@ const styles = StyleSheet.create({
   timeText: { fontSize: 11, color: "#818cf8", fontWeight: "600" },
   timeTextClosed: { color: "#34e0a1" },
 
-  questionSection: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 14, gap: 6 },
-  question: { fontSize: 22, fontWeight: "800", color: "#f1f5f9", lineHeight: 30, letterSpacing: -0.3 },
-  voteCount: { fontSize: 13, color: "#64748b" },
-
-  winnerBanner: {
+  // Status row (open vote)
+  statusRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 14,
-    marginHorizontal: 16,
-    marginBottom: 16,
-    backgroundColor: "#451a0366",
-    borderRadius: 14,
-    padding: 14,
-    borderWidth: 1,
-    borderColor: "#f59e0b44",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#1e293b",
   },
-  winnerEmoji: { fontSize: 36 },
-  winnerLabel: { fontSize: 11, fontWeight: "600", color: "#f59e0b", textTransform: "uppercase", letterSpacing: 0.5 },
-  winnerName: { fontSize: 16, fontWeight: "800", color: "#f1f5f9", marginTop: 2 },
-
-  // ── Voting section ──
-  votingSection: { paddingHorizontal: 16, paddingBottom: 8 },
-  votingHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 4 },
-  votingSectionTitle: { fontSize: 14, fontWeight: "700", color: "#f1f5f9" },
+  statusText: { fontSize: 13, color: "#64748b" },
   editLink: { fontSize: 13, color: "#6366f1", fontWeight: "600" },
-  votingHint: { fontSize: 12, color: "#475569", marginBottom: 14 },
 
-  // ── Rank items ──
+  // Drag list area
+  listScroll: {
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 8,
+  },
+  edgeLabel: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 12,
+  },
+  edgeLine: { flex: 1, height: 1, backgroundColor: "#1e293b" },
+  edgeLabelText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#334155",
+    textTransform: "uppercase",
+    letterSpacing: 0.8,
+  },
+
+  // Rank items
   rankItem: {
     flexDirection: "row",
     alignItems: "center",
@@ -508,30 +536,45 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#334155",
   },
+  rankItemTop: {
+    borderColor: "#f59e0b55",
+    backgroundColor: "#1c160a",
+  },
   rankItemActive: {
     borderColor: "#6366f1",
     backgroundColor: "#1e2a4a",
     shadowColor: "#6366f1",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 8,
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    elevation: 10,
   },
   rankBadge: {
-    width: 28,
-    height: 28,
-    borderRadius: 8,
-    borderWidth: 1,
+    width: 30,
+    height: 30,
+    borderRadius: 9,
+    backgroundColor: "#334155",
     alignItems: "center",
     justifyContent: "center",
   },
-  rankBadgeText: { fontSize: 13, fontWeight: "800" },
-  rankOptionEmoji: { fontSize: 22 },
-  rankOptionLabel: { fontSize: 14, fontWeight: "600", color: "#f1f5f9", lineHeight: 18 },
-  rankOptionMeta: { fontSize: 11, color: "#475569", marginTop: 1 },
-  dragHandle: { gap: 4, paddingVertical: 4, paddingLeft: 4 },
+  rankBadgeTop: { backgroundColor: "#78350f" },
+  rankBadgeBottom: { backgroundColor: "#1e293b", borderWidth: 1, borderColor: "#334155" },
+  rankNum: { fontSize: 13, fontWeight: "800", color: "#94a3b8" },
+  rankNumTop: { color: "#fbbf24" },
+  itemEmoji: { fontSize: 22 },
+  itemLabel: { fontSize: 14, fontWeight: "700", color: "#f1f5f9" },
+  itemMeta: { fontSize: 11, color: "#475569", marginTop: 2 },
+  dragHandle: { gap: 4, paddingVertical: 6, paddingLeft: 4 },
   dhLine: { width: 18, height: 2, borderRadius: 1, backgroundColor: "#475569" },
 
+  // Submit button (pinned)
+  submitRow: {
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#1e293b",
+    backgroundColor: "#0f172a",
+  },
   submitBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -540,24 +583,44 @@ const styles = StyleSheet.create({
     backgroundColor: "#6366f1",
     borderRadius: 14,
     paddingVertical: 16,
-    marginTop: 16,
   },
-  submitBtnDisabled: { backgroundColor: "#312e81", opacity: 0.6 },
+  submitBtnLoading: { opacity: 0.6 },
   submitBtnText: { fontSize: 16, fontWeight: "700", color: "#fff" },
 
-  // ── Results section ──
-  resultsSection: { paddingHorizontal: 16, paddingTop: 24 },
-  resultsSectionTitle: {
+  // Results (closed)
+  resultsScroll: { padding: 16, gap: 12 },
+  winnerBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+    backgroundColor: "#1c140866",
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "#f59e0b44",
+    marginBottom: 4,
+  },
+  winnerEmoji: { fontSize: 40 },
+  winnerLabel: { fontSize: 11, fontWeight: "700", color: "#f59e0b", textTransform: "uppercase", letterSpacing: 0.5 },
+  winnerName: { fontSize: 17, fontWeight: "800", color: "#f1f5f9", marginTop: 3 },
+
+  sectionLabel: {
     fontSize: 12,
     fontWeight: "700",
     color: "#475569",
     textTransform: "uppercase",
     letterSpacing: 0.5,
-    marginBottom: 12,
+    marginTop: 4,
   },
-  noVotesText: { fontSize: 14, color: "#334155" },
+  scoringNote: {
+    fontSize: 12,
+    color: "#334155",
+    lineHeight: 17,
+    marginBottom: 4,
+  },
+  emptyText: { fontSize: 14, color: "#334155" },
 
-  bordaRow: {
+  resultRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
@@ -567,17 +630,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#334155",
   },
-  bordaRowWinner: { borderColor: "#f59e0b66", backgroundColor: "#1c1408" },
-  bordaMedal: { fontSize: 22, width: 28, textAlign: "center" },
-  bordaEmoji: { fontSize: 20 },
-  bordaLabel: { fontSize: 14, fontWeight: "700", color: "#f1f5f9" },
-  bordaMeta: { fontSize: 11, color: "#475569" },
-  bordaBarBg: {
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: "#334155",
-    overflow: "hidden",
-    marginTop: 2,
-  },
-  bordaBar: { height: 4, borderRadius: 2 },
+  resultRowWinner: { borderColor: "#f59e0b55", backgroundColor: "#1c1408" },
+  resultMedal: { fontSize: 22, width: 28, textAlign: "center" },
+  resultEmoji: { fontSize: 20 },
+  resultLabel: { fontSize: 14, fontWeight: "700", color: "#f1f5f9" },
+  resultBarBg: { height: 5, borderRadius: 3, backgroundColor: "#334155", overflow: "hidden", marginVertical: 3 },
+  resultBar: { height: 5, borderRadius: 3 },
+  resultMeta: { fontSize: 11, color: "#64748b" },
 });

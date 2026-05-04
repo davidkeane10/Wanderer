@@ -26,6 +26,7 @@ import React, {
   useState,
 } from "react";
 import { auth, db } from "../services/firebase";
+import { registerForPushNotifications } from "../services/notifications";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -123,6 +124,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
 
       setIsLoading(false);
+      registerForPushNotifications(firebaseUser.uid).catch(() => {});
     });
 
     return unsub;
