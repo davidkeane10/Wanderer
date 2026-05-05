@@ -15,10 +15,10 @@ import { useCallback, useState } from "react";
 import { fetchAbandonedAlongRailways, fetchNearbyAbandonedPlaces } from "../services/abandonedOsm";
 import { fetchYouTubeUrbexPlaces } from "../services/youtube";
 import { fetchNearbyTrails } from "../services/alltrails";
-import type { AISuggestion, CategoryKey, QueryParams } from "../services/ollama";
-import { enrichResults, expandQuery, extractUrbexLocations, filterArcGISForUrbex, suggestPlaces } from "../services/ollama";
+import type { AISuggestion, CategoryKey, ExtractedLocation, QueryParams } from "../services/ollama";
+import { enrichResults, expandQuery, extractPlacesFromText, extractUrbexLocations, filterArcGISForUrbex, suggestPlaces } from "../services/ollama";
 import { fetchArcGISUrbexPlaces } from "../services/arcgis";
-import { fetchPosts, searchPosts } from "../services/reddit";
+import { fetchLocalQuestionPosts, fetchPostComments, fetchPosts, searchPosts } from "../services/reddit";
 import { fetchWikipediaNearby } from "../services/wikipedia";
 import { fetchWikidataAbandonedPlaces } from "../services/wikidata";
 import type { ActivityType, FeedItem } from "../types/feed";
@@ -108,9 +108,9 @@ const CATEGORY_ACTIVITY_TYPE: Record<CategoryKey, ActivityType> = {
   other: "adventure",
 };
 
-// Geographic terms that signal a named place in user descriptions.
+// Natural/outdoor geographic terms — safe for ALL categories.
 // Ordered longest-first so multi-word terms match before their substrings.
-const GEO_TERMS = [
+const GEO_TERMS_OUTDOOR = [
   "national park", "state park", "state forest", "national forest",
   "nature reserve", "wilderness area", "wildlife refuge", "recreation area",
   "wilderness", "reserve", "preserve",
@@ -119,19 +119,44 @@ const GEO_TERMS = [
   "creek", "harbor", "peninsula", "butte", "plateau",
 ];
 
+// Urbex/historic structure terms — ONLY used when the category is urbex.
+// Adding these to hiking searches causes false positive named-place pins (e.g.
+// "backpacking trail" → "backpacking mill" matches "paper mill" nearby).
+const GEO_TERMS_URBEX_EXTRA = [
+  "sanatorium", "sanitarium", "asylum", "penitentiary", "prison", "hospital",
+  "mine", "mill", "factory", "cemetery", "mansion", "castle", "fort",
+  "abbey", "convent", "station", "depot", "warehouse",
+];
+
 const GENERIC_PREFIXES = new Set([
   "the", "a", "an", "any", "some", "old", "new", "little", "big", "great",
   "small", "local", "nearby", "another", "other", "this", "that",
 ]);
 
+// Patterns that can NEVER be a useful named place for hiking.
+// Anything matching this is disqualified even if it contains a GEO_TERM.
+const HIKING_REJECT_TITLE = /\b(railroad|railway|rail road|paper mill|lumber mill|sawmill|power plant|power station|water treatment|sewage|industrial|disused|abandoned|derelict)\b/i;
+
 /**
  * Scans the user's description for a named geographic place
- * (e.g. "Tillamook Forest", "Quicksilver Park", "Crater Lake").
+ * (e.g. "Tillamook Forest", "Quicksilver Park", "Crater Lake", "Mount Rainier").
+ * Category-aware: urbex-specific terms only activate when category is "urbex".
  * Returns the best match as a geocodeable string, or null if nothing found.
  */
-function extractNamedPlaceFromDescription(description: string): string | null {
+function extractNamedPlaceFromDescription(description: string, category: CategoryKey): string | null {
   const text = description.trim();
-  for (const term of GEO_TERMS) {
+
+  // "Mount X" / "Mt X" patterns — prefix comes before the name, not caught by suffix scan
+  const mountMatch = text.match(/\b(mount|mt\.?)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)/i);
+  if (mountMatch) {
+    return `${mountMatch[1]} ${mountMatch[2]}`;
+  }
+
+  const geoTerms = category === "urbex"
+    ? [...GEO_TERMS_OUTDOOR, ...GEO_TERMS_URBEX_EXTRA]
+    : GEO_TERMS_OUTDOOR;
+
+  for (const term of geoTerms) {
     const escaped = term.replace(/\s+/g, "\\s+");
     const pattern = new RegExp(
       `\\b([A-Za-z]+(?:\\s+[A-Za-z]+){0,3})\\s+${escaped}\\b`,
@@ -283,11 +308,11 @@ function scoreAgainstQuery(item: FeedItem, params: QueryParams): number {
     if (elevWords[params.elevationPreference]?.some((w) => text.includes(w))) score += 1;
   }
 
-  // Backpacking preference: reward longer trails and camping
+  // Backpacking preference: reward longer trails (20+ miles) and camping keywords
   if (params.isBackpacking) {
     const distKm = item.trailDistanceKm ?? 0;
-    if (distKm >= 15) score += 3;
-    else if (distKm >= 8) score += 1;
+    if (distKm >= 32) score += 3;      // 20+ miles — proper backpacking distance
+    else if (distKm >= 16) score += 1; // 10+ miles — borderline acceptable
 
     if (/\b(camp(?:site|ground|ing)?|overnight|backcountry|shelter|hut|permit)\b/.test(text)) score += 2;
   }
@@ -320,6 +345,125 @@ function aiSuggestionsToQuestResults(
     createdAt: null,
     rating: null,
   }));
+}
+
+/**
+ * Mines Reddit Q&A posts (e.g. "Best trails near Portland?") by fetching
+ * their top comments, extracting specific place names via AI, geocoding each
+ * result, and returning proper FeedItems with map coordinates.
+ *
+ * Runs concurrently with the main source fetches so it doesn't add wall time
+ * unless it outlasts all other sources (~10-20s on slow networks).
+ */
+async function mineQuestionPostComments(
+  category: CategoryKey,
+  subreddits: string[],
+  locationKeywords: string[],
+  location: SearchInput["location"],
+  activityType: ActivityType
+): Promise<FeedItem[]> {
+  if (locationKeywords.length === 0) return [];
+
+  try {
+    const questionPosts = await fetchLocalQuestionPosts(subreddits, locationKeywords, 8);
+    if (questionPosts.length === 0) return [];
+
+    const postsToMine = questionPosts.slice(0, 4);
+
+    // Fetch comments + run AI extraction for each post in parallel
+    const miningResults = await Promise.allSettled(
+      postsToMine.map(async (post) => {
+        const comments = await fetchPostComments(post.permalink, 12);
+        if (comments.length === 0) return [] as ExtractedLocation[];
+
+        const commentText = comments
+          .slice(0, 8)
+          .map((c) => c.body)
+          .join("\n\n---\n\n");
+
+        return extractPlacesFromText(
+          category,
+          post.title,
+          commentText,
+          location.cityName,
+          location.regionName
+        ).then((places) =>
+          places.map((p) => ({
+            ...p,
+            _sourceTitle: post.title,
+            _sourcePermalink: post.permalink,
+            _sourceScore: post.score,
+            _sourceComments: post.num_comments,
+            _sourceCreated: post.created_utc,
+          }))
+        );
+      })
+    );
+
+    type EnrichedPlace = ExtractedLocation & {
+      _sourceTitle: string;
+      _sourcePermalink: string;
+      _sourceScore: number;
+      _sourceComments: number;
+      _sourceCreated: number;
+    };
+
+    const allCandidates: EnrichedPlace[] = [];
+    for (const r of miningResults) {
+      if (r.status === "fulfilled") allCandidates.push(...(r.value as EnrichedPlace[]));
+    }
+
+    if (allCandidates.length === 0) return [];
+
+    // Deduplicate by normalised name
+    const seenNames = new Set<string>();
+    const unique = allCandidates.filter((c) => {
+      const key = c.name.toLowerCase().trim();
+      if (seenNames.has(key)) return false;
+      seenNames.add(key);
+      return true;
+    });
+
+    // Geocode all candidates — skip any that fail and have low confidence
+    const geocoded = await Promise.allSettled(
+      unique.map((c) =>
+        geocodeNamedPlace(c.name, null, location.cityName, location.regionName).catch(() => null)
+      )
+    );
+
+    const items: FeedItem[] = [];
+    for (let i = 0; i < unique.length; i++) {
+      const candidate = unique[i];
+      const g = geocoded[i];
+      const geoResult = g.status === "fulfilled" ? g.value : null;
+
+      // Require coords — a pin without a location is useless here
+      if (!geoResult) continue;
+
+      items.push({
+        id: `reddit_mine_${category}_${candidate.name.replace(/\W+/g, "_").toLowerCase().slice(0, 30)}_${i}`,
+        source: "reddit",
+        activityType,
+        title: candidate.name,
+        description: `Recommended by the Reddit community in response to: "${candidate._sourceTitle}"`,
+        imageUrl: null,
+        externalUrl: `https://www.reddit.com${candidate._sourcePermalink}`,
+        locationName: candidate.searchQuery,
+        locationCoords: { latitude: geoResult.latitude, longitude: geoResult.longitude },
+        score: candidate._sourceScore,
+        commentCount: candidate._sourceComments,
+        createdAt: candidate._sourceCreated,
+        sourceName: "Reddit · Community Pick",
+        rating: null,
+      });
+    }
+
+    if (__DEV__) console.log(`[SQ] Reddit mining: ${postsToMine.length} posts → ${allCandidates.length} candidates → ${items.length} geocoded`);
+    return items;
+  } catch (err) {
+    if (__DEV__) console.warn("[SQ] mineQuestionPostComments failed:", err);
+    return [];
+  }
 }
 
 async function fetchForCategory(
@@ -430,10 +574,14 @@ async function fetchForCategory(
 
     // Launch all sources simultaneously — flush to UI as each one finishes.
     // Reddit is typically first (~1-2s), OSM/Wiki arrive later (~5-15s).
+    // Question post mining runs in the background and flushes last (~10-20s).
     const backpacking = isBackpackingSearch(input.description);
     const redditPromise = redditSearch(CATEGORY_SUBREDDITS.hiking, citySubreddits, queryParams.keywords, locationKeywords, activityType);
     const osmPromise    = coords ? fetchNearbyTrails(coords.latitude, coords.longitude, radiusMeters, { backpackingMode: backpacking }) : Promise.resolve([] as FeedItem[]);
     const wikiPromise   = coords ? fetchWikipediaNearby(coords.latitude, coords.longitude, radiusMeters, location.cityName, location.regionName) : Promise.resolve([] as FeedItem[]);
+    // Start Q&A mining immediately — runs concurrently with all other sources
+    const minePromise = mineQuestionPostComments(category, CATEGORY_SUBREDDITS.hiking, locationKeywords, location, activityType);
+
     // Reddit — fastest, show first
     const redditResult = await redditPromise.then(v => ({ status: "fulfilled" as const, value: v })).catch(e => ({ status: "rejected" as const, reason: e }));
     addSocialTracked("Reddit", redditResult, redditResult.status === "fulfilled" ? redditResult.value : []);
@@ -460,6 +608,11 @@ async function fetchForCategory(
 
     addTracked("OpenStreetMap", osm, enrichedOsm);
     addTracked("Wikipedia", wiki, remainingWiki);
+    flush();
+
+    // Community picks — await the mining that's been running in the background
+    const mineResult = await minePromise.then(v => ({ status: "fulfilled" as const, value: v })).catch(e => ({ status: "rejected" as const, reason: e }));
+    addTracked("Reddit · Community", mineResult, mineResult.status === "fulfilled" ? mineResult.value : []);
     flush();
 
   } else if (category === "urbex") {
@@ -597,12 +750,18 @@ async function fetchForCategory(
 
     const redditPromise = redditSearch(townSubs, [], queryParams.keywords, locationKeywords, activityType);
     const wikiPromise   = coords ? fetchWikipediaNearby(coords.latitude, coords.longitude, radiusMeters, location.cityName, location.regionName) : Promise.resolve([] as FeedItem[]);
+    const minePromise   = mineQuestionPostComments(category, townSubs, locationKeywords, location, activityType);
+
     const redditResult = await redditPromise.then(v => ({ status: "fulfilled" as const, value: v })).catch(e => ({ status: "rejected" as const, reason: e }));
     addTracked("Reddit", redditResult, redditResult.status === "fulfilled" ? redditResult.value : []);
     flush();
 
     const [wiki] = await Promise.allSettled([wikiPromise]);
     addTracked("Wikipedia", wiki, wiki.status === "fulfilled" ? wiki.value : []);
+    flush();
+
+    const mineResult = await minePromise.then(v => ({ status: "fulfilled" as const, value: v })).catch(e => ({ status: "rejected" as const, reason: e }));
+    addTracked("Reddit · Community", mineResult, mineResult.status === "fulfilled" ? mineResult.value : []);
     flush();
   }
 
@@ -668,12 +827,14 @@ export function useQuestSearch() {
         const keywords = backpacking
           ? [...new Set([...baseKeywords, "overnight", "camping", "backcountry", "multi-day"])].slice(0, 8)
           : baseKeywords;
+        const rawDistKm = milesMatch ? parseFloat(milesMatch[1]) * 1.609 : kmMatch ? parseFloat(kmMatch[1]) : null;
         return {
           keywords,
           elevationPreference: dl.includes("flat") ? "flat" : dl.includes("steep") ? "steep" : "any",
           difficulty: /\beasy\b/.test(dl) ? "easy" : /\bhard\b|\bdifficult\b|\bchallenging\b/.test(dl) ? "hard" : /\bmoderate\b/.test(dl) ? "moderate" : null,
           estimatedDurationHours: null,
-          trailDistanceKm: milesMatch ? parseFloat(milesMatch[1]) * 1.609 : kmMatch ? parseFloat(kmMatch[1]) : null,
+          // Backpacking without an explicit distance defaults to 32 km (20 miles)
+          trailDistanceKm: backpacking && rawDistKm === null ? 32 : rawDistKm,
           summary: input.description,
           isBackpacking: backpacking,
         };
@@ -690,9 +851,12 @@ export function useQuestSearch() {
       let queryParams: QueryParams = buildFallbackParams();
 
       // Detect named geographic place in the description (e.g. "Tillamook Forest",
-      // "Quicksilver Park"). If found and in range, shift the search centre to it.
-      // If out of range, surface a hint so the UI can inform the user.
-      const namedPlace = extractNamedPlaceFromDescription(input.description);
+      // "Mount Rainier", "Waverly Hills Sanatorium"). If found:
+      //   - Geocode it and create a pinned result that always appears first.
+      //   - If in range, shift the search centre to it.
+      //   - If out of range, show a hint and still pin it on the map.
+      let namedPlaceResult: QuestResult | null = null;
+      const namedPlace = extractNamedPlaceFromDescription(input.description, input.category);
       if (namedPlace && coords) {
         try {
           const geo = await geocodeNamedPlace(namedPlace, null, input.location.cityName ?? null, input.location.regionName ?? null);
@@ -709,6 +873,27 @@ export function useQuestSearch() {
                 `${namedPlace} is ${distStr} away — outside your ${input.distanceKm} km search range. Showing results near your current location instead. Try expanding your range to explore there.`
               );
             }
+            // Always create a pinned result for the exact named place so it
+            // appears as #1 on both the map and the list.
+            namedPlaceResult = {
+              id: `named_place_${namedPlace.replace(/\W+/g, "_").toLowerCase()}`,
+              source: "ai" as const,
+              sourceName: "Searched Location",
+              activityType: CATEGORY_ACTIVITY_TYPE[input.category],
+              title: namedPlace,
+              description: `Exact location match for "${namedPlace}"`,
+              aiDescription: `Exact location match for "${namedPlace}"`,
+              relevanceScore: 999,
+              imageUrl: null,
+              externalUrl: "",
+              locationName: namedPlace,
+              locationCoords: { latitude: geo.latitude, longitude: geo.longitude },
+              score: null,
+              commentCount: null,
+              createdAt: null,
+              rating: null,
+            };
+            setResults([namedPlaceResult]);
           }
         } catch {
           // Geocoding failed silently — proceed with original coords
@@ -719,11 +904,32 @@ export function useQuestSearch() {
 
       // Helper: score + sort a raw item list into QuestResults for immediate display
       function toQuestResults(raw: FeedItem[], params: QueryParams): QuestResult[] {
-        const scored = raw.map((item) => ({ item, score: scoreAgainstQuery(item, params) }));
+        // Category-aware hard pre-filter — drop results that can never match the intent.
+        // Runs before scoring so irrelevant items never inflate the list.
+        const preFiltered = raw.filter((item) => {
+          if (input.category === "hiking") {
+            // Railroad corridors and industrial sites are never hiking trails
+            if (item.sourceName === "Railroad Corridor") return false;
+            if (HIKING_REJECT_TITLE.test(item.title)) return false;
+          }
+          if (params.isBackpacking) {
+            // For backpacking, non-trail OSM/structured data is useless —
+            // keep Reddit/AI items (they might discuss real trails) but drop
+            // structured data items that lack any trail signal.
+            const t = `${item.title} ${item.description}`.toLowerCase();
+            const hasTrailSignal =
+              item.trailDistanceKm != null ||
+              /\b(trail|hike|hiking|backpack|wilderness|backcountry|camp|summit|peak|ridge|trailhead|loop|route)\b/.test(t);
+            if (!hasTrailSignal && (item.source === "arcgis" || item.sourceName === "Railroad Corridor")) return false;
+          }
+          return true;
+        });
+
+        const scored = preFiltered.map((item) => ({ item, score: scoreAgainstQuery(item, params) }));
         const hasKeywords = params.keywords.length > 0;
         const passed = hasKeywords
           ? scored.filter((s) => s.score > 0 || s.item.locationCoords !== null).map((s) => s.item)
-          : raw;
+          : preFiltered;
 
         const scoredMap = new Map(scored.map((s) => [s.item.id, s.score]));
         const qr: QuestResult[] = passed.map((item) => ({
@@ -754,8 +960,9 @@ export function useQuestSearch() {
       }
 
       // Phase 2: Fetch all sources — onBatch fires after each wave so the UI
-      // updates progressively (Reddit first ~1-2s, OSM/Wiki ~5-15s later)
-      let currentResults: QuestResult[] = [];
+      // updates progressively (Reddit first ~1-2s, OSM/Wiki ~5-15s later).
+      // Seed with the named place result (score 999) so it stays pinned at #1.
+      let currentResults: QuestResult[] = namedPlaceResult ? [namedPlaceResult] : [];
 
       const rawItems = await fetchForCategory(input, coords, queryParams, (batchRaw) => {
         const batchQR = toQuestResults(batchRaw, queryParams);
@@ -778,7 +985,8 @@ export function useQuestSearch() {
       if (aiParams.keywords.join() !== queryParams.keywords.join()) {
         queryParams = { ...aiParams, isBackpacking: queryParams.isBackpacking };
         const reScored = toQuestResults(rawItems, queryParams);
-        currentResults = mergeInto([], reScored); // full re-score from raw
+        // Seed with named place so it survives the full re-score
+        currentResults = mergeInto(namedPlaceResult ? [namedPlaceResult] : [], reScored);
         if (__DEV__) console.log(`[SQ] AI re-score applied: summary="${aiParams.summary}"`);
       }
       setSummary(queryParams.summary || input.description);
@@ -879,6 +1087,13 @@ export function useQuestSearch() {
         const { inRange, nearby } = partitionByRadius(currentResults, coords, input.distanceKm);
         currentResults = inRange as QuestResult[];
         finalNearby = nearby as QuestResult[];
+      }
+
+      // The named place must always be #1 in results regardless of distance filter.
+      if (namedPlaceResult) {
+        finalNearby = finalNearby.filter((r) => r.id !== namedPlaceResult!.id);
+        currentResults = currentResults.filter((r) => r.id !== namedPlaceResult!.id);
+        currentResults.unshift(namedPlaceResult);
       }
 
       // Persist to cache so the next identical search is instant

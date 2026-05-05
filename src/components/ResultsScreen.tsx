@@ -35,6 +35,7 @@ interface ResultsScreenProps {
   error: string | null;
   locationHint?: string | null;
   userCoords: { latitude: number; longitude: number } | null;
+  distanceKm?: number | null;
   onBack: () => void;
   onRetry: () => void;
 }
@@ -57,6 +58,7 @@ export function ResultsScreen({
   error,
   locationHint,
   userCoords,
+  distanceKm,
   onBack,
   onRetry,
 }: ResultsScreenProps) {
@@ -129,6 +131,7 @@ export function ResultsScreen({
           selectedId={selectedId}
           userLat={userCoords?.latitude}
           userLng={userCoords?.longitude}
+          radiusKm={distanceKm}
           onMarkerTap={handleMarkerTap}
         />
         {showFullScreenLoader && (

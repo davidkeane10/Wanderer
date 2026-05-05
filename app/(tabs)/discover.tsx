@@ -62,6 +62,7 @@ export default function DiscoverTab() {
           error={error}
           locationHint={locationHint}
           userCoords={location.coords}
+          distanceKm={lastInput?.distanceKm}
           onBack={handleBack}
           onRetry={handleRetry}
         />

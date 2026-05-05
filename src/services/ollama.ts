@@ -711,6 +711,72 @@ export interface ExtractedLocation {
   confidence: number;
 }
 
+/**
+ * Extracts specific named places from a Reddit Q&A thread (title + comments).
+ * Works for any category — hiking trails, abandoned places, restaurants, etc.
+ * Used to turn "What are the best trails near Denver?" posts into real listings.
+ */
+export async function extractPlacesFromText(
+  category: CategoryKey,
+  postTitle: string,
+  commentText: string,
+  cityName: string | null,
+  regionName: string | null
+): Promise<ExtractedLocation[]> {
+  if (!commentText || commentText.trim().length < 30) return [];
+
+  const context = [cityName, regionName].filter(Boolean).join(", ") || "unknown area";
+  const ctx = CATEGORY_CONTEXT[category];
+
+  try {
+    const raw = await aiChat(
+      `You extract specific real place names from Reddit Q&A threads about ${ctx.label}.
+Extract only concrete named places — trail names, park names, mountains, abandoned buildings, etc.
+Skip phrases like "a place nearby", "somewhere I know", or generic descriptions.
+Return ONLY valid JSON, no explanation, no markdown.`,
+      `Searching near: ${context}
+Category: ${ctx.label}
+
+Thread title: ${postTitle}
+
+Top community replies:
+${commentText.slice(0, 2500)}
+
+Return a JSON array of specific real places mentioned (empty array [] if none):
+[{
+  "name": "Exact place name as mentioned",
+  "searchQuery": "Geocodable search string e.g. 'Eagle Creek Trail, Columbia River Gorge, Oregon'",
+  "confidence": 0.9
+}]
+
+confidence: 0.9–1.0 = exact named place with location context, 0.6–0.8 = named place only, below 0.6 = skip.
+Only include items with confidence >= 0.6.`,
+      USE_CLAUDE ? 15_000 : 180_000
+    );
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (r) =>
+          r &&
+          typeof r.name === "string" &&
+          typeof r.searchQuery === "string" &&
+          typeof r.confidence === "number" &&
+          r.confidence >= 0.6
+      )
+      .slice(0, 8)
+      .map((r) => ({
+        name: String(r.name).slice(0, 120),
+        searchQuery: String(r.searchQuery).slice(0, 200),
+        confidence: Math.min(1, Math.max(0, r.confidence)),
+      }));
+  } catch (err) {
+    if (__DEV__) console.warn(`[AI] extractPlacesFromText failed:`, err);
+    return [];
+  }
+}
+
 export async function extractUrbexLocations(
   postTitle: string,
   postBody: string,

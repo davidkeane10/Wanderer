@@ -33,6 +33,7 @@ interface LeafletMapProps {
   selectedId: string | null;
   userLat?: number | null;
   userLng?: number | null;
+  radiusKm?: number | null;
   onMarkerTap?: (id: string) => void;
 }
 
@@ -76,7 +77,8 @@ html,body{width:100%;height:100%;background:#1e293b}
 var map=L.map('map',{zoomControl:false});
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
 map.setView([20,0],2);
-var _m={},_sel=null,_um=null;
+var _m={},_sel=null,_um=null,_rc=null;
+var _userLat=null,_userLng=null,_radiusM=null,_hasMarkers=false;
 var _tip=document.getElementById('tip');
 var _tipImg=document.getElementById('tip-img');
 var _tipTitle=document.getElementById('tip-title');
@@ -133,6 +135,7 @@ function setMarkers(list){
     _m[item.id]={m:mk,n:i+1,data:item};
     pts.push([item.lat,item.lng]);
   });
+  if(pts.length>0)_hasMarkers=true;
   if(!_sel){
     if(pts.length===1){map.setView(pts[0],13);}
     else if(pts.length>1){try{map.fitBounds(pts,{padding:[45,45],maxZoom:12});}catch(e){map.setView(pts[0],12);}}
@@ -144,9 +147,18 @@ function selectMarker(id){
   _sel=id;
   if(id&&_m[id]){var c=_m[id];c.m.setIcon(_icon(c.n,true));map.flyTo(c.m.getLatLng(),13,{animate:true,duration:0.5});}
 }
+function _drawRadius(){
+  if(_rc){_rc.remove();_rc=null;}
+  if(_userLat==null||_radiusM==null)return;
+  _rc=L.circle([_userLat,_userLng],{radius:_radiusM,color:'#6366f1',fillColor:'#6366f1',fillOpacity:0.07,weight:1.5,opacity:0.4,dashArray:'6 4',interactive:false}).addTo(map);
+  if(!_hasMarkers){map.fitBounds(_rc.getBounds(),{padding:[20,20]});}
+}
+function setRadius(radiusM){_radiusM=radiusM;_drawRadius();}
 function setUser(lat,lng){
   if(_um)_um.remove();
+  _userLat=lat;_userLng=lng;
   _um=L.marker([lat,lng],{icon:L.divIcon({className:'',html:'<div class="pin pu"></div>',iconSize:[14,14],iconAnchor:[7,7]})}).addTo(map);
+  _drawRadius();
 }
 map.on('click',function(){_hideTip(0);});
 function _send(d){try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(JSON.stringify(d));}catch(e){}}
@@ -156,6 +168,7 @@ function _handle(raw){
     if(msg.type==='markers')setMarkers(msg.data);
     else if(msg.type==='select')selectMarker(msg.id);
     else if(msg.type==='user')setUser(msg.lat,msg.lng);
+    else if(msg.type==='radius')setRadius(msg.radiusM);
   }catch(e){}
 }
 document.addEventListener('message',function(e){_handle(e.data);});
@@ -169,6 +182,7 @@ export function LeafletMap({
   selectedId,
   userLat,
   userLng,
+  radiusKm,
   onMarkerTap,
 }: LeafletMapProps) {
   const webviewRef    = useRef<WebView>(null);
@@ -217,6 +231,13 @@ export function LeafletMap({
     }
   }, [userLat, userLng]);
 
+  // Push search radius — draws a circle and zooms to it before pins arrive
+  useEffect(() => {
+    if (radiusKm != null) {
+      inject(`setRadius(${radiusKm * 1000})`);
+    }
+  }, [radiusKm]);
+
   function handleMessage(event: { nativeEvent: { data: string } }) {
     try {
       const msg = JSON.parse(event.nativeEvent.data);
@@ -239,6 +260,9 @@ export function LeafletMap({
     }));
     if (data.length > 0) {
       webviewRef.current?.injectJavaScript(`setMarkers(${JSON.stringify(data)}); true;`);
+    }
+    if (radiusKm != null) {
+      webviewRef.current?.injectJavaScript(`setRadius(${radiusKm * 1000}); true;`);
     }
     if (userLat != null && userLng != null) {
       webviewRef.current?.injectJavaScript(`setUser(${userLat},${userLng}); true;`);

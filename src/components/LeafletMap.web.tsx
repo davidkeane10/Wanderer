@@ -12,6 +12,7 @@ interface LeafletMapProps {
   selectedId: string | null;
   userLat?: number | null;
   userLng?: number | null;
+  radiusKm?: number | null;
   onMarkerTap?: (id: string) => void;
 }
 
@@ -53,7 +54,8 @@ html,body{width:100%;height:100%;background:#1e293b}
 var map=L.map('map',{zoomControl:false});
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
 map.setView([20,0],2);
-var _m={},_sel=null,_um=null;
+var _m={},_sel=null,_um=null,_rc=null;
+var _userLat=null,_userLng=null,_radiusM=null,_hasMarkers=false;
 var _tip=document.getElementById('tip');
 var _tipImg=document.getElementById('tip-img');
 var _tipTitle=document.getElementById('tip-title');
@@ -100,6 +102,7 @@ function setMarkers(list){
     _m[item.id]={m:mk,n:i+1,data:item};
     pts.push([item.lat,item.lng]);
   });
+  if(pts.length>0)_hasMarkers=true;
   if(!_sel){
     if(pts.length===1){map.setView(pts[0],13);}
     else if(pts.length>1){try{map.fitBounds(pts,{padding:[45,45],maxZoom:12});}catch(e){map.setView(pts[0],12);}}
@@ -111,9 +114,18 @@ function selectMarker(id){
   _sel=id;
   if(id&&_m[id]){var c=_m[id];c.m.setIcon(_icon(c.n,true));map.flyTo(c.m.getLatLng(),13,{animate:true,duration:0.5});}
 }
+function _drawRadius(){
+  if(_rc){_rc.remove();_rc=null;}
+  if(_userLat==null||_radiusM==null)return;
+  _rc=L.circle([_userLat,_userLng],{radius:_radiusM,color:'#6366f1',fillColor:'#6366f1',fillOpacity:0.07,weight:1.5,opacity:0.4,dashArray:'6 4',interactive:false}).addTo(map);
+  if(!_hasMarkers){map.fitBounds(_rc.getBounds(),{padding:[20,20]});}
+}
+function setRadius(radiusM){_radiusM=radiusM;_drawRadius();}
 function setUser(lat,lng){
   if(_um)_um.remove();
+  _userLat=lat;_userLng=lng;
   _um=L.marker([lat,lng],{icon:L.divIcon({className:'',html:'<div class="pin pu"></div>',iconSize:[14,14],iconAnchor:[7,7]})}).addTo(map);
+  _drawRadius();
 }
 map.on('click',function(){_hideTip(0);});
 window.addEventListener('message',function(e){
@@ -122,6 +134,7 @@ window.addEventListener('message',function(e){
     if(msg.type==='markers')setMarkers(msg.data);
     else if(msg.type==='select')selectMarker(msg.id);
     else if(msg.type==='user')setUser(msg.lat,msg.lng);
+    else if(msg.type==='radius')setRadius(msg.radiusM);
   }catch(e){}
 });
 </script>
@@ -133,6 +146,7 @@ export function LeafletMap({
   selectedId,
   userLat,
   userLng,
+  radiusKm,
   onMarkerTap,
 }: LeafletMapProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -169,12 +183,15 @@ export function LeafletMap({
       iframeRef.current?.contentWindow?.postMessage(json, "*");
     }
     pendingRef.current = [];
-    // Push current state
-    if (markers.length > 0) {
-      send({ type: "markers", data: markers });
+    // Push current state — radius first so the circle is drawn before user dot
+    if (radiusKm != null) {
+      send({ type: "radius", radiusM: radiusKm * 1000 });
     }
     if (userLat != null && userLng != null) {
       send({ type: "user", lat: userLat, lng: userLng });
+    }
+    if (markers.length > 0) {
+      send({ type: "markers", data: markers });
     }
     if (selectedId) {
       send({ type: "select", id: selectedId });
@@ -194,6 +211,12 @@ export function LeafletMap({
       send({ type: "user", lat: userLat, lng: userLng });
     }
   }, [userLat, userLng]);
+
+  useEffect(() => {
+    if (radiusKm != null) {
+      send({ type: "radius", radiusM: radiusKm * 1000 });
+    }
+  }, [radiusKm]);
 
   return (
     <View style={styles.container}>
