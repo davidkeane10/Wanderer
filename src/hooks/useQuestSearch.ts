@@ -25,7 +25,7 @@ import type { ActivityType, FeedItem } from "../types/feed";
 import { filterByRadius, haversineKm, partitionByRadius } from "../utils/distance";
 import { geocodeResultCoords } from "../services/geocodeCache";
 import { redditPostToFeedItem } from "../utils/feedConverters";
-import { forwardGeocode, geocodeNamedPlace } from "../services/geocode";
+import { forwardGeocode, geocodeNamedPlace, geocodeNamedPlaceWithConfidence } from "../services/geocode";
 import { getCitySubreddits } from "../utils/locationParser";
 import { readJsonCache, writeJsonCache } from "../utils/feedCache";
 
@@ -360,7 +360,8 @@ async function mineQuestionPostComments(
   subreddits: string[],
   locationKeywords: string[],
   location: SearchInput["location"],
-  activityType: ActivityType
+  activityType: ActivityType,
+  distanceKm?: number
 ): Promise<FeedItem[]> {
   if (locationKeywords.length === 0) return [];
 
@@ -424,10 +425,11 @@ async function mineQuestionPostComments(
       return true;
     });
 
-    // Geocode all candidates — skip any that fail and have low confidence
+    // Geocode all candidates — pass userCoords so Photon/Nominatim bias toward
+    // the search area and results outside the radius are discarded automatically.
     const geocoded = await Promise.allSettled(
       unique.map((c) =>
-        geocodeNamedPlace(c.name, null, location.cityName, location.regionName).catch(() => null)
+        geocodeNamedPlace(c.name, null, location.cityName, location.regionName, location.coords, distanceKm).catch(() => null)
       )
     );
 
@@ -580,7 +582,7 @@ async function fetchForCategory(
     const osmPromise    = coords ? fetchNearbyTrails(coords.latitude, coords.longitude, radiusMeters, { backpackingMode: backpacking }) : Promise.resolve([] as FeedItem[]);
     const wikiPromise   = coords ? fetchWikipediaNearby(coords.latitude, coords.longitude, radiusMeters, location.cityName, location.regionName) : Promise.resolve([] as FeedItem[]);
     // Start Q&A mining immediately — runs concurrently with all other sources
-    const minePromise = mineQuestionPostComments(category, CATEGORY_SUBREDDITS.hiking, locationKeywords, location, activityType);
+    const minePromise = mineQuestionPostComments(category, CATEGORY_SUBREDDITS.hiking, locationKeywords, location, activityType, distanceKm);
 
     // Reddit — fastest, show first
     const redditResult = await redditPromise.then(v => ({ status: "fulfilled" as const, value: v })).catch(e => ({ status: "rejected" as const, reason: e }));
@@ -660,19 +662,24 @@ async function fetchForCategory(
         if (locationCandidates.length > 0) {
           if (__DEV__) console.log(`[SQ:${searchId}] 🤖 AI extracted ${locationCandidates.length} location candidates — geocoding`);
 
+          // Use the confidence-scored geocoder so we can gate on how certain
+          // the coordinate is (OSM hit = 0.95, Photon biased = 0.80, etc.)
           const geocoded = await Promise.allSettled(
-            locationCandidates.map(c => forwardGeocode(c.searchQuery).catch(() => null))
+            locationCandidates.map(c =>
+              geocodeNamedPlaceWithConfidence(c.name, c.searchQuery, location.cityName, location.regionName, coords, distanceKm).catch(() => null)
+            )
           );
 
           const aiMined: FeedItem[] = [];
           for (let i = 0; i < locationCandidates.length; i++) {
             const g = geocoded[i];
             const candidate = locationCandidates[i];
-            const geoResult = g.status === "fulfilled" ? g.value : null;
+            const resolved = g.status === "fulfilled" ? g.value : null;
 
-            // Only add if geocoding resolved coords (proves it's a real place)
-            // OR confidence is very high (named building mentioned by author)
-            if (!geoResult && candidate.confidence < 0.85) continue;
+            // Require geocode confidence >= 0.70 OR very high AI extraction confidence.
+            // This prevents low-precision Photon guesses from placing pins in the wrong city.
+            const geoConfidence = resolved?.confidence ?? 0;
+            if (geoConfidence < 0.70 && candidate.confidence < 0.85) continue;
 
             aiMined.push({
               id: `ai_urbex_${candidate.sourcePost.id}_${i}`,
@@ -683,11 +690,11 @@ async function fetchForCategory(
               imageUrl: null,
               externalUrl: candidate.sourcePost.externalUrl,
               locationName: candidate.searchQuery,
-              locationCoords: geoResult ? { latitude: geoResult.latitude, longitude: geoResult.longitude } : null,
+              locationCoords: resolved ? resolved.coords : null,
               score: candidate.sourcePost.score,
               commentCount: candidate.sourcePost.commentCount,
               createdAt: candidate.sourcePost.createdAt,
-              sourceName: "Reddit · AI",
+              sourceName: resolved ? `Reddit · AI (${resolved.source})` : "Reddit · AI",
               rating: null,
             });
           }
@@ -750,7 +757,7 @@ async function fetchForCategory(
 
     const redditPromise = redditSearch(townSubs, [], queryParams.keywords, locationKeywords, activityType);
     const wikiPromise   = coords ? fetchWikipediaNearby(coords.latitude, coords.longitude, radiusMeters, location.cityName, location.regionName) : Promise.resolve([] as FeedItem[]);
-    const minePromise   = mineQuestionPostComments(category, townSubs, locationKeywords, location, activityType);
+    const minePromise   = mineQuestionPostComments(category, townSubs, locationKeywords, location, activityType, distanceKm);
 
     const redditResult = await redditPromise.then(v => ({ status: "fulfilled" as const, value: v })).catch(e => ({ status: "rejected" as const, reason: e }));
     addTracked("Reddit", redditResult, redditResult.status === "fulfilled" ? redditResult.value : []);
@@ -859,7 +866,9 @@ export function useQuestSearch() {
       const namedPlace = extractNamedPlaceFromDescription(input.description, input.category);
       if (namedPlace && coords) {
         try {
-          const geo = await geocodeNamedPlace(namedPlace, null, input.location.cityName ?? null, input.location.regionName ?? null);
+          // Pass coords as bias only — no radius cap, since out-of-range results
+          // are shown with a distance hint rather than silently discarded here.
+          const geo = await geocodeNamedPlace(namedPlace, null, input.location.cityName ?? null, input.location.regionName ?? null, coords);
           if (geo) {
             const dist = haversineKm(coords.latitude, coords.longitude, geo.latitude, geo.longitude);
             if (dist <= input.distanceKm) {

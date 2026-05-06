@@ -1,4 +1,5 @@
 import { forwardGeocode, geocodeNamedPlace } from "./geocode";
+import type { Coords } from "./geocode";
 import type { FeedItem } from "../types/feed";
 
 interface CachedCoords {
@@ -12,7 +13,8 @@ const cache = new Map<string, CachedCoords | null>();
 const inflight = new Map<string, Promise<CachedCoords | null>>();
 
 export async function geocodeWithCache(
-  locationName: string
+  locationName: string,
+  biasCoords?: Coords | null
 ): Promise<CachedCoords | null> {
   const key = locationName.toLowerCase().trim();
 
@@ -20,7 +22,7 @@ export async function geocodeWithCache(
 
   if (inflight.has(key)) return inflight.get(key)!;
 
-  const promise = forwardGeocode(locationName).then((result) => {
+  const promise = forwardGeocode(locationName, biasCoords).then((result) => {
     const coords = result
       ? { latitude: result.latitude, longitude: result.longitude }
       : null;
@@ -35,15 +37,20 @@ export async function geocodeWithCache(
 
 /**
  * Attempts to resolve coordinates for a FeedItem that has no locationCoords.
- * Uses the smarter multi-strategy geocoder (Photon unrestricted + Wikipedia)
+ * Uses the smarter multi-strategy geocoder (Photon biased + Nominatim + Wikipedia)
  * and shares the same dedup/cache layer so identical lookups are never repeated.
+ *
+ * userCoords + maxRadiusKm are forwarded to geocodeNamedPlace so results that
+ * land outside the search area are discarded rather than pinned in the wrong place.
  *
  * Returns the updated item (with coords filled in) or the original if geocoding fails.
  */
 export async function geocodeResultCoords(
   item: FeedItem,
   cityHint: string | null,
-  regionHint: string | null
+  regionHint: string | null,
+  userCoords?: Coords | null,
+  maxRadiusKm?: number
 ): Promise<FeedItem> {
   if (item.locationCoords) return item; // already has coords
 
@@ -63,7 +70,9 @@ export async function geocodeResultCoords(
     item.title,
     item.locationName ?? null,
     cityHint,
-    regionHint
+    regionHint,
+    userCoords,
+    maxRadiusKm
   ).then((coords) => {
     cache.set(cacheKey, coords);
     inflight.delete(cacheKey);

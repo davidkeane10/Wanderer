@@ -10,7 +10,8 @@ import { Platform } from "react-native";
 import type { ActivityType, FeedItem } from "../types/feed";
 import type { RedditPost } from "../types/reddit";
 import { redditPostToFeedItem } from "../utils/feedConverters";
-import { forwardGeocode } from "../services/geocode";
+import { forwardGeocode, geocodeNamedPlace } from "../services/geocode";
+import { extractUrbexLocations } from "../services/ollama";
 import {
   getCitySubreddits,
   isPostLikelyLocal,
@@ -51,6 +52,90 @@ const URBEX_CAT       = CATEGORIES.find((c) => c.key === "urban")!;
 const ADVENTURE_CAT   = CATEGORIES.find((c) => c.key === "adventure")!;
 const SOCIAL_CAT      = CATEGORIES.find((c) => c.key === "social")!;
 
+
+/**
+/**
+ * Runs AI location extraction over urbex Reddit post bodies, geocodes each
+ * result with location bias, and returns new FeedItems with map coordinates.
+ *
+ * Runs in Phase 2 (background) so it never blocks the initial Reddit render.
+ * Only text posts with >150 chars of selftext are processed (up to 5).
+ */
+async function mineUrbexSelftext(
+  items: FeedItem[],
+  location: Location,
+  userCoords: { latitude: number; longitude: number },
+  radiusKm: number
+): Promise<FeedItem[]> {
+  const postsToMine = items
+    .filter((item) => (item.redditSelftext ?? "").length > 150)
+    .slice(0, 5);
+
+  if (postsToMine.length === 0) return [];
+
+  const extractionResults = await Promise.allSettled(
+    postsToMine.map((item) =>
+      extractUrbexLocations(item.title, item.redditSelftext ?? "", location.cityName, location.regionName)
+    )
+  );
+
+  const candidates: Array<{
+    name: string;
+    searchQuery: string;
+    confidence: number;
+    sourceItem: FeedItem;
+  }> = [];
+
+  for (let i = 0; i < postsToMine.length; i++) {
+    const r = extractionResults[i];
+    if (r.status !== "fulfilled") continue;
+    for (const loc of r.value) {
+      candidates.push({ ...loc, sourceItem: postsToMine[i] });
+    }
+  }
+
+  if (candidates.length === 0) return [];
+
+  const geocoded = await Promise.allSettled(
+    candidates.map((c) =>
+      geocodeNamedPlace(c.name, null, location.cityName, location.regionName, userCoords, radiusKm).catch(() => null)
+    )
+  );
+
+  const feedItems: FeedItem[] = [];
+  const seenNames = new Set<string>();
+
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    const g = geocoded[i];
+    const coords = g.status === "fulfilled" ? g.value : null;
+
+    if (!coords && c.confidence < 0.85) continue;
+    const nameKey = c.name.toLowerCase().trim();
+    if (seenNames.has(nameKey)) continue;
+    seenNames.add(nameKey);
+
+    feedItems.push({
+      id: `reddit_urbex_mined_${c.sourceItem.id}_${i}`,
+      source: "reddit" as const,
+      activityType: "urbex" as const,
+      title: c.name,
+      description: `Mentioned in: "${c.sourceItem.title}"`,
+      imageUrl: c.sourceItem.imageUrl ?? null,
+      externalUrl: c.sourceItem.externalUrl ?? "",
+      locationName: c.searchQuery,
+      locationCoords: coords,
+      score: c.sourceItem.score,
+      commentCount: c.sourceItem.commentCount,
+      createdAt: c.sourceItem.createdAt,
+      sourceName: c.sourceItem.sourceName ?? "Reddit",
+      rating: null,
+      redditPermalink: c.sourceItem.redditPermalink,
+    });
+  }
+
+  return feedItems;
+}
 
 /**
  * Fetch one Reddit category's posts and tag them with an activityType.
@@ -107,8 +192,8 @@ async function fetchCategoryReddit(
       after,
       timeframe: "month",
     });
-    // Also fetch local Q&A posts to mine for place mentions (trails only)
-    if (activityType === "trails" && !after) {
+    // Fetch local Q&A posts to mine for place mentions (trails + urbex)
+    if ((activityType === "trails" || activityType === "urbex") && !after) {
       questionPostsPromise = fetchLocalQuestionPosts(citySubs, locationKeywords, 8);
     }
   }
@@ -245,16 +330,69 @@ function shuffleMerge(arrays: FeedItem[][]): FeedItem[] {
   return result;
 }
 
+/** Normalise a title for fuzzy deduplication: lowercase, strip punctuation, collapse spaces. */
+function normTitle(t: string): string {
+  return t.toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Deduplicates items by ID first, then by normalised title within the same
+ * activityType. When two items share a title, the one with coordinates wins
+ * and its sourceName is updated to note both sources.
+ *
+ * This handles the common case where the same place appears from multiple
+ * sources — e.g. a Reddit mention (no coords) and an OSM result (with coords).
+ */
 function deduplicateAndMerge(existing: FeedItem[], incoming: FeedItem[]): FeedItem[] {
-  const seen = new Set(existing.map((i) => i.id));
-  const result = [...existing];
-  for (const item of incoming) {
-    if (!seen.has(item.id)) {
-      seen.add(item.id);
-      result.push(item);
-    }
+  const byId  = new Map<string, FeedItem>(existing.map((i) => [i.id, i]));
+  // title+activityType key → id of the winning item
+  const byTitle = new Map<string, string>();
+
+  for (const item of existing) {
+    const titleKey = `${item.activityType}:${normTitle(item.title)}`;
+    if (!byTitle.has(titleKey)) byTitle.set(titleKey, item.id);
   }
-  return result;
+
+  for (const item of incoming) {
+    // Exact ID dedup — skip if already seen
+    if (byId.has(item.id)) continue;
+
+    const titleKey = `${item.activityType}:${normTitle(item.title)}`;
+    const existingId = byTitle.get(titleKey);
+
+    if (existingId) {
+      // Same place from a different source — keep the version with coordinates,
+      // merge sourceName so the user knows it appeared in multiple places.
+      const existing = byId.get(existingId)!;
+      if (!existing.locationCoords && item.locationCoords) {
+        // Incoming has coords, existing doesn't — upgrade existing entry
+        const merged: FeedItem = {
+          ...existing,
+          locationCoords: item.locationCoords,
+          sourceName: existing.sourceName
+            ? `${existing.sourceName} · ${item.sourceName ?? ""}`
+            : item.sourceName,
+        };
+        byId.set(existingId, merged);
+      } else if (existing.locationCoords && !item.locationCoords) {
+        // Existing has coords, incoming doesn't — just note the extra source
+        const merged: FeedItem = {
+          ...existing,
+          sourceName: existing.sourceName
+            ? `${existing.sourceName} · ${item.sourceName ?? ""}`
+            : item.sourceName,
+        };
+        byId.set(existingId, merged);
+      }
+      // Both have or both lack coords — keep first seen, ignore duplicate
+      continue;
+    }
+
+    byId.set(item.id, item);
+    byTitle.set(titleKey, item.id);
+  }
+
+  return Array.from(byId.values());
 }
 
 /**
@@ -457,8 +595,15 @@ export function useDiscoverFeed({
             try { osmAbandoned = await fetchNearbyAbandonedPlaces(trailCoords.latitude, trailCoords.longitude, osmRadius); } catch { osmAbandoned = []; }
           }
 
-          // Wikipedia + Wikidata run in parallel
-          const [wikipediaResult, wikidataResult] = await Promise.allSettled([
+          // Geocode Phase 1 Q&A-extracted items that have no coords yet.
+          // These come from extractTrailsFromText / fetchLocalQuestionPosts and
+          // are identifiable by their "extracted_" id prefix.
+          const q2aItemsToGeocode = phase1Sorted
+            .filter((item) => !item.locationCoords && item.id.startsWith("extracted_"))
+            .slice(0, 10);
+
+          // Wikipedia, Wikidata, Reddit urbex mining, and Q&A geocoding run in parallel
+          const [wikipediaResult, wikidataResult, urbexMinedResult, q2aGeocodeResult] = await Promise.allSettled([
             trailCoords
               ? fetchWikipediaNearby(
                   trailCoords.latitude,
@@ -475,12 +620,41 @@ export function useDiscoverFeed({
                   radiusKm ?? 25,
                 )
               : Promise.resolve([] as FeedItem[]),
+            // AI-mine urbex Reddit posts for specific named locations
+            trailCoords && urbexItems.length > 0
+              ? mineUrbexSelftext(urbexItems, location, trailCoords, radiusKm ?? 25)
+              : Promise.resolve([] as FeedItem[]),
+            // Resolve coordinates for Q&A-extracted trail/urbex items from Phase 1
+            trailCoords && q2aItemsToGeocode.length > 0
+              ? Promise.allSettled(
+                  q2aItemsToGeocode.map((item) =>
+                    geocodeNamedPlace(
+                      item.title, item.locationName ?? null,
+                      location.cityName, location.regionName,
+                      trailCoords, radiusKm ?? 25
+                    ).catch(() => null)
+                  )
+                )
+              : Promise.resolve([]),
           ]);
 
-          const wikiItems = wikipediaResult.status === "fulfilled" ? wikipediaResult.value : [];
-          const wikidataItems = wikidataResult.status === "fulfilled" ? wikidataResult.value : [];
+          const wikiItems     = wikipediaResult.status === "fulfilled" ? wikipediaResult.value : [];
+          const wikidataItems = wikidataResult.status === "fulfilled"  ? wikidataResult.value  : [];
+          const urbexMined    = urbexMinedResult.status === "fulfilled" ? urbexMinedResult.value : [];
 
-          const newSupplemental = [...osm, ...osmAbandoned, ...wikidataItems, ...wikiItems];
+          // Build a coords map from Q&A geocoding results so we can patch Phase 1 items
+          const q2aCoordsMap = new Map<string, { latitude: number; longitude: number }>();
+          if (q2aGeocodeResult.status === "fulfilled" && Array.isArray(q2aGeocodeResult.value)) {
+            const geocodedCoords = q2aGeocodeResult.value as PromiseSettledResult<{ latitude: number; longitude: number } | null>[];
+            for (let i = 0; i < q2aItemsToGeocode.length; i++) {
+              const r = geocodedCoords[i];
+              if (r?.status === "fulfilled" && r.value) {
+                q2aCoordsMap.set(q2aItemsToGeocode[i].id, r.value);
+              }
+            }
+          }
+
+          const newSupplemental = [...osm, ...osmAbandoned, ...wikidataItems, ...wikiItems, ...urbexMined];
           if (newSupplemental.length > 0) {
             supplementalRef.current = newSupplemental;
           }
@@ -501,7 +675,13 @@ export function useDiscoverFeed({
               ([t, o], item) => (item.source === "trails" ? [[...t, item], o] : [t, [...o, item]]),
               [[], []]
             );
-            const combined = [...osmTrails, ...shuffleMerge([phase1Sorted, otherSupplemental])];
+            // Patch Q&A items in phase1 with resolved coordinates before merging
+            const phase1WithCoords = q2aCoordsMap.size > 0
+              ? phase1Sorted.map((item) =>
+                  q2aCoordsMap.has(item.id) ? { ...item, locationCoords: q2aCoordsMap.get(item.id)! } : item
+                )
+              : phase1Sorted;
+            const combined = [...osmTrails, ...shuffleMerge([phase1WithCoords, otherSupplemental])];
             const deduped = deduplicateAndMerge([], combined);
             const sorted = sortByProximity(deduped, location.coords, location.cityName, location.regionName);
             if (sorted.length > 0) {

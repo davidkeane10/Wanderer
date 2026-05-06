@@ -262,9 +262,10 @@ export async function fetchYouTubeUrbexPlaces(
       continue;
     }
 
-    // Geocode extracted locations
+    // Geocode extracted locations — pass userCoords so Photon biases toward the
+    // search area and results outside the radius are discarded automatically.
     const geocodeResults = await Promise.allSettled(
-      locations.map(loc => forwardGeocode(loc.searchQuery).catch(() => null))
+      locations.map(loc => forwardGeocode(loc.searchQuery, userCoords).catch(() => null))
     );
 
     for (let i = 0; i < locations.length; i++) {
@@ -274,7 +275,8 @@ export async function fetchYouTubeUrbexPlaces(
 
       if (!geoResult && loc.confidence < 0.85) continue;
 
-      // Radius check — drop if we have coords and they're out of range
+      // Radius check — forwardGeocode now biases toward userCoords, but apply
+      // an explicit distance gate as a final safety net.
       if (geoResult && userCoords && distanceKm) {
         const dLat = geoResult.latitude  - userCoords.latitude;
         const dLon = geoResult.longitude - userCoords.longitude;
