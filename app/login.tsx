@@ -1,6 +1,8 @@
 import { Ionicons } from "@expo/vector-icons";
+import * as Google from "expo-auth-session/providers/google";
 import { useRouter } from "expo-router";
-import React, { useState } from "react";
+import * as WebBrowser from "expo-web-browser";
+import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -16,12 +18,29 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAuth } from "../src/context/AuthContext";
 
+WebBrowser.maybeCompleteAuthSession();
+
 type Mode = "login" | "register" | "forgot";
 
 export default function LoginScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { signIn, signUp, resetPassword } = useAuth();
+  const { signIn, signUp, resetPassword, signInWithGoogle } = useAuth();
+
+  const [_request, response, promptGoogleAsync] = Google.useAuthRequest({
+    webClientId: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+  });
+
+  useEffect(() => {
+    if (response?.type !== "success") return;
+    const { idToken, accessToken } = response.authentication ?? {};
+    if (!idToken) return;
+    setLoading(true);
+    signInWithGoogle(idToken, accessToken ?? null)
+      .then(() => router.replace("/(tabs)/discover" as any))
+      .catch((err) => Alert.alert("Google sign-in failed", friendlyError(err)))
+      .finally(() => setLoading(false));
+  }, [response]);
 
   const [mode, setMode] = useState<Mode>("login");
   const [name, setName] = useState("");
@@ -260,6 +279,26 @@ export default function LoginScreen() {
             )}
           </TouchableOpacity>
 
+          {/* Google sign-in — login and register only */}
+          {mode !== "forgot" && (
+            <>
+              <View style={styles.dividerRow}>
+                <View style={styles.dividerLine} />
+                <Text style={styles.dividerText}>or</Text>
+                <View style={styles.dividerLine} />
+              </View>
+              <TouchableOpacity
+                style={[styles.googleBtn, loading && styles.submitBtnDisabled]}
+                onPress={() => promptGoogleAsync()}
+                disabled={loading}
+                activeOpacity={0.85}
+              >
+                <Ionicons name="logo-google" size={18} color="#f1f5f9" style={{ marginRight: 10 }} />
+                <Text style={styles.googleBtnText}>Continue with Google</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
           {/* Mode switcher */}
           <View style={styles.switchRow}>
             {mode === "login" && (
@@ -406,6 +445,39 @@ const styles = StyleSheet.create({
   },
   submitBtnDisabled: { opacity: 0.6 },
   submitBtnText: { fontSize: 16, fontWeight: "700", color: "#fff" },
+
+  dividerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: "#334155",
+  },
+  dividerText: {
+    fontSize: 12,
+    color: "#475569",
+    fontWeight: "600",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  googleBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#1e293b",
+    borderRadius: 14,
+    paddingVertical: 14,
+    borderWidth: 1.5,
+    borderColor: "#334155",
+  },
+  googleBtnText: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#f1f5f9",
+  },
 
   switchRow: {
     flexDirection: "row",

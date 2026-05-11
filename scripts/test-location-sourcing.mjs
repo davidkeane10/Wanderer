@@ -176,6 +176,18 @@ function coords(r) {
   return `${r.lat.toFixed(4)}, ${r.lon.toFixed(4)}`;
 }
 
+// Parses OSM `distance` tag into km. Handles bare numbers (assumed km),
+// "24 km", "15 mi", "15 miles". Returns null if unparseable or absent.
+function parseOsmDistanceKm(tags) {
+  const raw = tags.distance ?? tags["distance:km"] ?? tags.length;
+  if (raw === undefined || raw === null) return null;
+  const str = String(raw).trim().toLowerCase();
+  const num = parseFloat(str);
+  if (isNaN(num)) return null;
+  if (str.endsWith("mi") || str.endsWith("miles")) return num * 1.60934;
+  return num;
+}
+
 function distNote(r, expected, toleranceKm) {
   if (!r) return "no result";
   const d = haversineKm(expected.lat, expected.lon, r.lat, r.lon);
@@ -214,6 +226,49 @@ const PLACES = {
 
 const DUBLIN  = PLACES.dunlinDublin;
 const DETROIT = PLACES.packardPlant;
+
+// ── Overpass connectivity probe (runs before any OSM sections) ────────────────
+// Informational only — does not count toward pass/fail totals.
+
+section("0 — Overpass API connectivity probe");
+console.log("  Pings each endpoint before any OSM queries run.\n");
+
+let overpassReachable = false;
+
+for (const endpoint of OVERPASS_URLS) {
+  const minimalQuery = `[out:json][timeout:5];\nnode(51.5,-0.1,51.6,0.0);out 1;`;
+  const start = Date.now();
+  try {
+    const res = await fetchWithTimeout(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `data=${encodeURIComponent(minimalQuery)}`,
+    }, 8_000);
+    const ms = Date.now() - start;
+    if (res.ok) {
+      overpassReachable = true;
+      console.log(`  ${PASS_EMOJI} ${endpoint} — HTTP ${res.status} (${ms}ms)`);
+    } else {
+      console.log(`  ${FAIL_EMOJI} ${endpoint} — HTTP ${res.status} (${ms}ms)`);
+    }
+  } catch (err) {
+    const ms = Date.now() - start;
+    const reason = err.name === "AbortError" ? "timed out" : (err.message ?? "connection refused");
+    console.log(`  ${FAIL_EMOJI} ${endpoint} — ${reason} (${ms}ms)`);
+  }
+}
+
+if (!overpassReachable) {
+  console.log(`\n  ${WARN_EMOJI} Both Overpass endpoints unreachable. To diagnose, run:`);
+  for (const ep of OVERPASS_URLS) {
+    console.log(`    curl -s -o /dev/null -w "%{http_code} %{time_total}s" -X POST "${ep}" \\`);
+    console.log(`      --data-urlencode 'data=[out:json];node(51.5,-0.1,51.6,0.0);out 1;'`);
+  }
+  console.log(`\n  Common causes:`);
+  console.log(`    • VPN or firewall blocking outbound port 443`);
+  console.log(`    • overpass-api.de rate-limiting your IP (wait a few minutes)`);
+  console.log(`    • DNS resolution failure (try: nslookup overpass-api.de)`);
+}
 
 // ── Section 1: Pure math ──────────────────────────────────────────────────────
 
@@ -685,6 +740,17 @@ const FEATURE_TESTS = [
     expectedFeatureLabel: "beach",
     checkFn: tags => tags.natural === "beach",
   },
+  // Backpacking — hike distance tag must be at least 15 miles (24.14 km)
+  {
+    desc: "backpacking trail or route",
+    anchorLabel: "Portland OR",
+    anchor: PLACES.portland,
+    radiusKm: 130,
+    osmTag: { key: "route", value: "hiking" },
+    expectedFeatureLabel: "hiking route",
+    checkFn: tags => tags.route === "hiking",
+    minTrailLengthKm: 24.14,
+  },
 ];
 
 for (const test of FEATURE_TESTS) {
@@ -711,6 +777,7 @@ for (const test of FEATURE_TESTS) {
 
   let allInRadius = true;
   let allHaveFeature = true;
+  let allMeetTrailLength = true;
 
   console.log(`    Top ${results.length} result(s) within ${test.radiusKm} km (${ms}ms):`);
   for (let i = 0; i < results.length; i++) {
@@ -718,16 +785,30 @@ for (const test of FEATURE_TESTS) {
     const d = haversineKm(test.anchor.lat, test.anchor.lon, r.lat, r.lon);
     const inRadius = d <= test.radiusKm;
     const hasFeature = test.checkFn(r.tags);
+    const trailLengthKm = parseOsmDistanceKm(r.tags);
+    const trailOk = !test.minTrailLengthKm || (trailLengthKm !== null && trailLengthKm >= test.minTrailLengthKm);
     if (!inRadius) allInRadius = false;
     if (!hasFeature) allHaveFeature = false;
-    const icon = inRadius && hasFeature ? "✅" : "❌";
+    if (!trailOk) allMeetTrailLength = false;
+    const icon = inRadius && hasFeature && trailOk ? "✅" : "❌";
     const tagWarning = hasFeature ? "" : ` ⚠️  tag mismatch`;
     const radiusWarning = inRadius ? "" : ` ⚠️  outside radius`;
-    console.log(`    ${icon} ${i + 1}. "${r.name}" — ${d.toFixed(1)} km away${tagWarning}${radiusWarning}`);
+    const trailNote = test.minTrailLengthKm
+      ? trailLengthKm === null
+        ? ` ⚠️  no distance tag`
+        : trailLengthKm >= test.minTrailLengthKm
+          ? ` trail ${(trailLengthKm * 0.621371).toFixed(1)} mi`
+          : ` ⚠️  trail only ${(trailLengthKm * 0.621371).toFixed(1)} mi (need ≥${(test.minTrailLengthKm * 0.621371).toFixed(0)} mi)`
+      : "";
+    console.log(`    ${icon} ${i + 1}. "${r.name}" — ${d.toFixed(1)} km away${trailNote}${tagWarning}${radiusWarning}`);
   }
 
   result(`${label} — all ${results.length} result(s) within ${test.radiusKm} km radius`, allInRadius);
   result(`${label} — all results tagged as expected (${test.expectedFeatureLabel})`, allHaveFeature);
+  if (test.minTrailLengthKm !== undefined) {
+    const minMi = (test.minTrailLengthKm * 0.621371).toFixed(0);
+    result(`${label} — all trails at least ${minMi} mi (${test.minTrailLengthKm.toFixed(1)} km) long`, allMeetTrailLength);
+  }
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────────

@@ -30,7 +30,7 @@ export default function Root({ children }: { children: React.ReactNode }) {
         {/* Prevent font scaling */}
         <ScrollViewStyleReset />
       </head>
-      <body>{children}</body>
+      <body style={{ backgroundColor: "#0f172a", margin: 0 }}>{children}</body>
     </html>
   );
 }

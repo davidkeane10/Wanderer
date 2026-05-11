@@ -55,7 +55,8 @@
           "locationWhenInUsePermission": "SideQuests uses your location to show adventures near you.",
           "isIosBackgroundLocationEnabled": false
         }
-      ]
+      ],
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true

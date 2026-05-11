@@ -10,9 +10,11 @@
  */
 
 import {
+  GoogleAuthProvider,
   createUserWithEmailAndPassword,
   onAuthStateChanged,
   sendPasswordResetEmail,
+  signInWithCredential,
   signInWithEmailAndPassword,
   signOut as firebaseSignOut,
   updateProfile,
@@ -44,6 +46,7 @@ interface AuthContextValue {
   isLoading: boolean;
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (name: string, email: string, password: string) => Promise<void>;
+  signInWithGoogle: (idToken: string, accessToken: string | null) => Promise<void>;
   signOut: () => Promise<void>;
   resetPassword: (email: string) => Promise<void>;
   updateDisplayName: (name: string) => Promise<void>;
@@ -77,6 +80,7 @@ const AuthContext = createContext<AuthContextValue>({
   isLoading: true,
   signIn: async () => {},
   signUp: async () => {},
+  signInWithGoogle: async () => {},
   signOut: async () => {},
   resetPassword: async () => {},
   updateDisplayName: async () => {},
@@ -151,6 +155,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setCurrentUser(profile);
   }, []);
 
+  const signInWithGoogle = useCallback(async (idToken: string, accessToken: string | null) => {
+    const credential = GoogleAuthProvider.credential(idToken, accessToken);
+    await signInWithCredential(auth, credential);
+  }, []);
+
   const signOut = useCallback(async () => {
     await firebaseSignOut(auth);
     setCurrentUser(null);
@@ -173,7 +182,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [currentUser]);
 
   return (
-    <AuthContext.Provider value={{ currentUser, isLoading, signIn, signUp, signOut, resetPassword, updateDisplayName }}>
+    <AuthContext.Provider value={{ currentUser, isLoading, signIn, signUp, signInWithGoogle, signOut, resetPassword, updateDisplayName }}>
       {children}
     </AuthContext.Provider>
   );
